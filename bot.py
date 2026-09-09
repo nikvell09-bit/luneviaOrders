@@ -1,44 +1,73 @@
 import os
 import sqlite3
-from datetime import datetime
-from dotenv import load_dotenv
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import asyncio
 import threading
+from datetime import datetime
+from functools import wraps
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from dotenv import load_dotenv
+from flask import (
+    Flask, render_template_string, request,
+    redirect, url_for, session, flash
+)
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
-    ContextTypes,
     MessageHandler,
+    ContextTypes,
     filters,
 )
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+# =========================================================
+# CONFIG
+# =========================================================
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-PAYMENT_DETAILS = os.getenv("PAYMENT_DETAILS", "Реквизиты оплаты пока не указаны. Добавьте PAYMENT_DETAILS в .env")
-SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "@LuneviaSupport")
+
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
+SECRET_KEY = os.getenv("SECRET_KEY", "change-me")
+
+PAYMENT_DETAILS = os.getenv(
+    "PAYMENT_DETAILS",
+    "Реквизиты оплаты пока не указаны."
+)
+
+SUPPORT_USERNAME = os.getenv(
+    "SUPPORT_USERNAME",
+    "@LuneviaSupport"
+)
+
 DB_FILE = "lunevia_orders.db"
+PORT = int(os.getenv("PORT", "10000"))
 
 PRICE_MINI = 299
 PRICE_LOVE = 499
 PRICE_PREMIUM = 899
 
 
-
 # =========================================================
-# БАЗА ЗАКАЗОВ
+# DATABASE
 # =========================================================
 
-def db_connect():
-    return sqlite3.connect(DB_FILE)
+def db():
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def now():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def init_db():
-    conn = db_connect()
+    conn = db()
     cur = conn.cursor()
 
     cur.execute("""
@@ -61,1727 +90,2226 @@ def init_db():
         )
     """)
 
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            telegram_id INTEGER PRIMARY KEY,
+            username TEXT,
+            language TEXT DEFAULT 'ru',
+            created_at TEXT NOT NULL,
+            last_seen TEXT NOT NULL
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS support_tickets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id INTEGER NOT NULL,
+            username TEXT,
+            language TEXT,
+            kind TEXT DEFAULT 'support',
+            subject TEXT,
+            status TEXT DEFAULT 'open',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS support_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticket_id INTEGER NOT NULL,
+            sender_type TEXT NOT NULL,
+            sender_id TEXT,
+            text TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            type TEXT,
+            title TEXT,
+            body TEXT,
+            order_id INTEGER,
+            ticket_id INTEGER,
+            is_read INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def save_user(user):
+    conn = db()
+
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO users
+        (telegram_id, username, language, created_at, last_seen)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(telegram_id)
+        DO UPDATE SET
+            username=excluded.username,
+            last_seen=excluded.last_seen
+    """, (
+        user.id,
+        user.username,
+        "ru",
+        now(),
+        now()
+    ))
+
     conn.commit()
     conn.close()
 
 
 def create_order(user, data):
-    conn = db_connect()
+    conn = db()
     cur = conn.cursor()
 
     cur.execute("""
         INSERT INTO orders (
-            telegram_id, username, language, site_type, tariff, price,
-            recipient_name, event_date, custom_text, photo_count, design,
-            status, created_at
+            telegram_id,
+            username,
+            language,
+            site_type,
+            tariff,
+            price,
+            recipient_name,
+            event_date,
+            custom_text,
+            photo_count,
+            design,
+            status,
+            created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'awaiting_payment', ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         user.id,
-        user.username or "",
-        data.get("lang", "ru"),
-        data.get("type", ""),
-        data.get("tariff", ""),
-        data.get("price", 0),
-        data.get("recipient_name", ""),
-        data.get("date", ""),
-        data.get("custom_text", ""),
+        user.username,
+        data.get("language", "ru"),
+        data.get("site_type"),
+        data.get("tariff"),
+        data.get("price"),
+        data.get("recipient_name"),
+        data.get("event_date"),
+        data.get("custom_text"),
         data.get("photo_count", 0),
-        data.get("design", ""),
-        datetime.now().isoformat(timespec="seconds"),
+        data.get("design"),
+        "awaiting_payment",
+        now()
     ))
 
     order_id = cur.lastrowid
+
     conn.commit()
     conn.close()
+
     return order_id
 
 
 def get_order(order_id):
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM orders WHERE id = ?", (order_id,))
-    row = cur.fetchone()
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM orders WHERE id=?",
+        (order_id,)
+    ).fetchone()
     conn.close()
     return row
 
 
 def get_user_orders(telegram_id):
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT id, tariff, price, status, created_at FROM orders "
-        "WHERE telegram_id = ? ORDER BY id DESC",
+    conn = db()
+    rows = conn.execute(
+        """
+        SELECT * FROM orders
+        WHERE telegram_id=?
+        ORDER BY id DESC
+        """,
         (telegram_id,)
-    )
-    rows = cur.fetchall()
+    ).fetchall()
     conn.close()
     return rows
 
 
 def set_receipt(order_id, file_id):
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE orders SET receipt_file_id = ?, status = 'payment_review' WHERE id = ?",
-        (file_id, order_id)
-    )
+    conn = db()
+
+    conn.execute("""
+        UPDATE orders
+        SET receipt_file_id=?, status='payment_review'
+        WHERE id=?
+    """, (file_id, order_id))
+
     conn.commit()
     conn.close()
+
+    order = get_order(order_id)
+
+    add_notification(
+        "payment",
+        "Новая оплата",
+        f"Заказ #{order_id} отправил чек",
+        order_id=order_id
+    )
 
 
 def set_status(order_id, status):
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE orders SET status = ? WHERE id = ?",
+    conn = db()
+
+    conn.execute(
+        "UPDATE orders SET status=? WHERE id=?",
         (status, order_id)
     )
+
     conn.commit()
     conn.close()
 
 
-def status_text(context, status):
-    if lang(context) == "uk":
-        return {
-            "awaiting_payment": "🟡 Очікує оплати",
-            "payment_review": "🟠 Перевірка оплати",
-            "paid": "🟢 Оплачено",
-            "in_progress": "🔵 У процесі",
-            "ready": "🟢 Готово",
-            "payment_rejected": "🔴 Оплату не підтверджено",
-            "cancelled": "⚫ Скасовано",
-        }.get(status, status)
+def add_notification(
+    ntype,
+    title,
+    body,
+    order_id=None,
+    ticket_id=None
+):
+    conn = db()
+
+    conn.execute("""
+        INSERT INTO notifications
+        (type, title, body, order_id, ticket_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (
+        ntype,
+        title,
+        body,
+        order_id,
+        ticket_id,
+        now()
+    ))
+
+    conn.commit()
+    conn.close()
+
+
+# =========================================================
+# SUPPORT
+# =========================================================
+
+def create_ticket(
+    telegram_id,
+    username,
+    language,
+    text,
+    kind="support"
+):
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO support_tickets
+        (
+            telegram_id,
+            username,
+            language,
+            kind,
+            subject,
+            status,
+            created_at,
+            updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, 'open', ?, ?)
+    """, (
+        telegram_id,
+        username,
+        language,
+        kind,
+        text[:100],
+        now(),
+        now()
+    ))
+
+    ticket_id = cur.lastrowid
+
+    cur.execute("""
+        INSERT INTO support_messages
+        (
+            ticket_id,
+            sender_type,
+            sender_id,
+            text,
+            created_at
+        )
+        VALUES (?, 'user', ?, ?, ?)
+    """, (
+        ticket_id,
+        str(telegram_id),
+        text,
+        now()
+    ))
+
+    conn.commit()
+    conn.close()
+
+    add_notification(
+        "support",
+        "Новое обращение",
+        text,
+        ticket_id=ticket_id
+    )
+
+    return ticket_id
+
+
+def add_support_message(
+    ticket_id,
+    sender_type,
+    sender_id,
+    text
+):
+    conn = db()
+
+    conn.execute("""
+        INSERT INTO support_messages
+        (
+            ticket_id,
+            sender_type,
+            sender_id,
+            text,
+            created_at
+        )
+        VALUES (?, ?, ?, ?, ?)
+    """, (
+        ticket_id,
+        sender_type,
+        str(sender_id),
+        text,
+        now()
+    ))
+
+    conn.execute("""
+        UPDATE support_tickets
+        SET updated_at=?
+        WHERE id=?
+    """, (now(), ticket_id))
+
+    conn.commit()
+    conn.close()
+
+
+def get_ticket(ticket_id):
+    conn = db()
+
+    ticket = conn.execute("""
+        SELECT * FROM support_tickets
+        WHERE id=?
+    """, (ticket_id,)).fetchone()
+
+    conn.close()
+
+    return ticket
+
+
+def get_ticket_messages(ticket_id):
+    conn = db()
+
+    rows = conn.execute("""
+        SELECT * FROM support_messages
+        WHERE ticket_id=?
+        ORDER BY id ASC
+    """, (ticket_id,)).fetchall()
+
+    conn.close()
+
+    return rows
+
+
+# =========================================================
+# TELEGRAM HELPERS
+# =========================================================
+
+async def send_telegram_message(chat_id, text):
+    if not BOT_TOKEN:
+        return
+
+    try:
+        async with Bot(BOT_TOKEN) as bot:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=text
+            )
+    except Exception as e:
+        print("Telegram send error:", e)
+
+
+async def notify_admin(text, keyboard=None):
+    if not ADMIN_ID:
+        return
+
+    if not BOT_TOKEN:
+        return
+
+    try:
+        async with Bot(BOT_TOKEN) as bot:
+            await bot.send_message(
+                chat_id=ADMIN_ID,
+                text=text,
+                reply_markup=keyboard
+            )
+    except Exception as e:
+        print("Admin notification error:", e)
+
+
+# =========================================================
+# TEXTS
+# =========================================================
+
+def status_text(status):
     return {
-        "awaiting_payment": "🟡 Ожидает оплаты",
+        "awaiting_payment": "💳 Ожидает оплаты",
         "payment_review": "🟠 Проверка оплаты",
-        "paid": "🟢 Оплачено",
-        "in_progress": "🔵 В процессе",
+        "paid": "💰 Оплачено",
+        "in_progress": "🔵 В работе",
         "ready": "🟢 Готово",
-        "payment_rejected": "🔴 Оплата не подтверждена",
-        "cancelled": "⚫ Отменено",
+        "payment_rejected": "🔴 Оплата отклонена",
+        "cancelled": "⚫ Отменён",
     }.get(status, status)
 
 
 # =========================================================
-# ЯЗЫКИ
+# TELEGRAM BOT
 # =========================================================
 
-def lang(context):
-    return context.user_data.get("lang", "ru")
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    save_user(user)
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🇺🇦 Українська",
+                callback_data="lang_uk"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "Русский",
+                callback_data="lang_ru"
+            )
+        ]
+    ])
+
+    await update.message.reply_text(
+        "❤️ Добро пожаловать в Lunevia!\n\n"
+        "Здесь мы создаём красивые персональные сайты "
+        "для любимых людей, свиданий, годовщин и других событий.\n\n"
+        "Выберите язык:",
+        reply_markup=keyboard
+    )
 
 
-def tr(context, ru, uk):
-    return uk if lang(context) == "uk" else ru
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+
+    await update.message.reply_text(
+        "❌ Действие отменено."
+    )
 
 
-def language_keyboard():
+def main_menu():
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🇺🇦 Українська", callback_data="lang_uk"),
-            InlineKeyboardButton("Русский", callback_data="lang_ru"),
+            InlineKeyboardButton(
+                "💌 Создать сайт",
+                callback_data="create_site"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "👀 Примеры",
+                callback_data="examples"
+            ),
+            InlineKeyboardButton(
+                "💰 Цены",
+                callback_data="prices"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "📖 О нас",
+                callback_data="about"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "📦 Мои заказы",
+                callback_data="my_orders"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "💬 Поддержка",
+                callback_data="support"
+            )
         ]
     ])
 
 
-async def choose_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def show_menu(update, context):
+    query = update.callback_query
+
+    if query:
+        await query.answer()
+        await query.edit_message_text(
+            "🏠 Главное меню",
+            reply_markup=main_menu()
+        )
+
+
+# =========================================================
+# ORDER CREATION
+# =========================================================
+
+async def create_site(update, context):
     query = update.callback_query
     await query.answer()
 
-    context.user_data["lang"] = "uk" if query.data == "lang_uk" else "ru"
+    context.user_data["order"] = {}
 
-    await show_main_menu(query, context)
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Не стираем уже выбранный язык.
-    selected_lang = context.user_data.get("lang")
-    context.user_data.clear()
-
-    if selected_lang:
-        context.user_data["lang"] = selected_lang
-        await update.message.reply_text(
-            tr(
-                context,
-                "💙 <b>Добро пожаловать в Lunevia!</b>\n\n"
-                "Создай особенный сайт для человека, который тебе дорог.\n\n"
-                "✨ Персональный дизайн\n"
-                "💌 Твой текст\n"
-                "📸 Фотографии\n"
-                "🎁 Интерактивные элементы\n"
-                "❤️ Красивые анимации\n\n"
-                "Выбери, что хочешь сделать:",
-                "💙 <b>Ласкаво просимо до Lunevia!</b>\n\n"
-                "Створи особливий сайт для людини, яка тобі дорога.\n\n"
-                "✨ Персональний дизайн\n"
-                "💌 Твій текст\n"
-                "📸 Фотографії\n"
-                "🎁 Інтерактивні елементи\n"
-                "❤️ Красиві анімації\n\n"
-                "Обери, що хочеш зробити:",
-            ),
-            parse_mode="HTML",
-            reply_markup=main_menu(context),
-        )
-        return
-
-    await update.message.reply_text(
-        "🌐 <b>Выбери язык / Обери мову</b>",
-        parse_mode="HTML",
-        reply_markup=language_keyboard(),
-    )
-
-
-# =========================================================
-# ГЛАВНОЕ МЕНЮ
-# =========================================================
-
-def main_menu(context):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(
-            tr(context, "💌 Создать сайт", "💌 Створити сайт"),
-            callback_data="create"
-        )],
+    keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
-                tr(context, "👀 Примеры", "👀 Приклади"),
-                callback_data="examples"
-            ),
-            InlineKeyboardButton(
-                tr(context, "💰 Цены", "💰 Ціни"),
-                callback_data="prices"
-            ),
+                "💑 Романтический",
+                callback_data="type_love"
+            )
         ],
-        [InlineKeyboardButton(
-            tr(context, "📖 Подробное описание", "📖 Детальний опис"),
-            callback_data="description"
-        )],
-        [InlineKeyboardButton(
-            tr(context, "📦 Мои заказы", "📦 Мої замовлення"),
-            callback_data="orders"
-        )],
-        [InlineKeyboardButton(
-            tr(context, "🆘 Поддержка", "🆘 Підтримка"),
-            callback_data="support"
-        )],
-        [InlineKeyboardButton(
-            tr(context, "🌐 Сменить язык", "🌐 Змінити мову"),
-            callback_data="language"
-        )],
+        [
+            InlineKeyboardButton(
+                "🎂 Праздник",
+                callback_data="type_event"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "✨ Другое",
+                callback_data="type_custom"
+            )
+        ]
     ])
 
-
-async def show_main_menu(query, context):
     await query.edit_message_text(
-        tr(
-            context,
-            "💙 <b>Добро пожаловать в Lunevia!</b>\n\n"
-            "Создай особенный сайт для человека, который тебе дорог.\n\n"
-            "✨ Персональный дизайн\n"
-            "💌 Твой текст\n"
-            "📸 Фотографии\n"
-            "🎁 Интерактивные элементы\n"
-            "❤️ Красивые анимации\n\n"
-            "Выбери, что хочешь сделать:",
-            "💙 <b>Ласкаво просимо до Lunevia!</b>\n\n"
-            "Створи особливий сайт для людини, яка тобі дорога.\n\n"
-            "✨ Персональний дизайн\n"
-            "💌 Твій текст\n"
-            "📸 Фотографії\n"
-            "🎁 Інтерактивні елементи\n"
-            "❤️ Красиві анімації\n\n"
-            "Обери, що хочеш зробити:",
-        ),
-        parse_mode="HTML",
-        reply_markup=main_menu(context),
+        "💌 Какой сайт создаём?",
+        reply_markup=keyboard
     )
 
 
-async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def choose_type(update, context):
     query = update.callback_query
     await query.answer()
 
-    current_lang = context.user_data.get("lang", "ru")
-    context.user_data.clear()
-    context.user_data["lang"] = current_lang
-
-    await show_main_menu(query, context)
-
-
-# =========================================================
-# СОЗДАНИЕ САЙТА — ТИП
-# =========================================================
-
-async def start_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    keyboard = [
-        [InlineKeyboardButton(
-            tr(context, "💙 Свидание", "💙 Побачення"),
-            callback_data="type_date"
-        )],
-        [InlineKeyboardButton(
-            tr(context, "🎂 День рождения", "🎂 День народження"),
-            callback_data="type_birthday"
-        )],
-        [InlineKeyboardButton(
-            tr(context, "💍 Предложение", "💍 Пропозиція"),
-            callback_data="type_proposal"
-        )],
-        [InlineKeyboardButton(
-            tr(context, "💌 Годовщина", "💌 Річниця"),
-            callback_data="type_anniversary"
-        )],
-        [InlineKeyboardButton(
-            tr(context, "🎁 Подарок", "🎁 Подарунок"),
-            callback_data="type_gift"
-        )],
-        [InlineKeyboardButton(
-            tr(context, "⬅️ Назад", "⬅️ Назад"),
-            callback_data="menu"
-        )],
-    ]
-
-    context.user_data["step"] = "type"
-
-    await query.edit_message_text(
-        tr(
-            context,
-            "💌 <b>Создание сайта</b>\n\n"
-            "Для начала выбери, для какого события нужен сайт:",
-            "💌 <b>Створення сайту</b>\n\n"
-            "Для початку обери, для якої події потрібен сайт:",
-        ),
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-
-
-async def choose_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    types_ru = {
-        "type_date": "💙 Свидание",
-        "type_birthday": "🎂 День рождения",
-        "type_proposal": "💍 Предложение",
-        "type_anniversary": "💌 Годовщина",
-        "type_gift": "🎁 Подарок",
+    types = {
+        "type_love": "Романтический",
+        "type_event": "Праздник",
+        "type_custom": "Другое"
     }
 
-    types_uk = {
-        "type_date": "💙 Побачення",
-        "type_birthday": "🎂 День народження",
-        "type_proposal": "💍 Пропозиція",
-        "type_anniversary": "💌 Річниця",
-        "type_gift": "🎁 Подарунок",
-    }
+    context.user_data["order"]["site_type"] = types.get(
+        query.data,
+        "Другое"
+    )
 
-    selected = (types_uk if lang(context) == "uk" else types_ru).get(query.data)
-    context.user_data["type"] = selected
-
-    await show_tariffs(query, context)
-
-
-# =========================================================
-# ТАРИФЫ
-# =========================================================
-
-async def show_tariffs(query, context):
-    if lang(context) == "uk":
-        text = (
-            "💰 <b>Обери тариф</b>\n\n"
-            f"🌙 <b>MINI — {PRICE_MINI} грн</b>\n"
-            "• персональний текст\n"
-            "• красивий дизайн\n"
-            "• базові анімації\n"
-            "• адаптація під телефон\n\n"
-            f"💙 <b>LOVE — {PRICE_LOVE} грн</b>\n"
-            "• усе з MINI\n"
-            "• фотографії\n"
-            "• інтерактивні кнопки\n"
-            "• вибір ресторану або варіанта\n"
-            "• додаткові анімації\n\n"
-            f"👑 <b>PREMIUM — {PRICE_PREMIUM} грн</b>\n"
-            "• усе з LOVE\n"
-            "• індивідуальна структура\n"
-            "• унікальний дизайн\n"
-            "• більше інтерактивних елементів\n"
-            "• додаткові функції\n\n"
-            "💙 Кожен сайт створюється індивідуально."
-        )
-        back = "⬅️ Назад"
-    else:
-        text = (
-            "💰 <b>Выбери тариф</b>\n\n"
-            f"🌙 <b>MINI — {PRICE_MINI} грн</b>\n"
-            "• персональный текст\n"
-            "• красивый дизайн\n"
-            "• базовые анимации\n"
-            "• адаптация под телефон\n\n"
-            f"💙 <b>LOVE — {PRICE_LOVE} грн</b>\n"
-            "• всё из MINI\n"
-            "• фотографии\n"
-            "• интерактивные кнопки\n"
-            "• выбор ресторана или варианта\n"
-            "• дополнительные анимации\n\n"
-            f"👑 <b>PREMIUM — {PRICE_PREMIUM} грн</b>\n"
-            "• всё из LOVE\n"
-            "• индивидуальная структура\n"
-            "• уникальный дизайн\n"
-            "• больше интерактивных элементов\n"
-            "• дополнительные функции\n\n"
-            "💙 Каждый сайт создаётся индивидуально."
-        )
-        back = "⬅️ Назад"
-
-    keyboard = [
-        [InlineKeyboardButton(f"🌙 MINI — {PRICE_MINI} грн", callback_data="tariff_mini")],
-        [InlineKeyboardButton(f"💙 LOVE — {PRICE_LOVE} грн", callback_data="tariff_love")],
-        [InlineKeyboardButton(f"👑 PREMIUM — {PRICE_PREMIUM} грн", callback_data="tariff_premium")],
-        [InlineKeyboardButton(back, callback_data="back_type")],
-    ]
-
-    context.user_data["step"] = "tariff"
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🌙 Mini — 299 грн",
+                callback_data="tariff_mini"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "❤️ Love — 499 грн",
+                callback_data="tariff_love"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "👑 Premium — 899 грн",
+                callback_data="tariff_premium"
+            )
+        ]
+    ])
 
     await query.edit_message_text(
-        text,
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        "💰 Выберите тариф:",
+        reply_markup=keyboard
     )
 
 
-async def choose_tariff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def choose_tariff(update, context):
     query = update.callback_query
     await query.answer()
 
     tariffs = {
-        "tariff_mini": ("🌙 MINI", PRICE_MINI),
-        "tariff_love": ("💙 LOVE", PRICE_LOVE),
-        "tariff_premium": ("👑 PREMIUM", PRICE_PREMIUM),
+        "tariff_mini": ("Mini", PRICE_MINI),
+        "tariff_love": ("Love", PRICE_LOVE),
+        "tariff_premium": ("Premium", PRICE_PREMIUM)
     }
 
-    tariff_name, price = tariffs[query.data]
-    context.user_data["tariff"] = tariff_name
-    context.user_data["price"] = price
-    context.user_data["step"] = "recipient_name"
+    tariff, price = tariffs[query.data]
+
+    context.user_data["order"]["tariff"] = tariff
+    context.user_data["order"]["price"] = price
+
+    context.user_data["step"] = "recipient"
 
     await query.edit_message_text(
-        tr(
-            context,
-            f"✅ Выбран тариф: <b>{tariff_name}</b>\n"
-            f"💰 Стоимость: <b>{price} грн</b>\n\n"
-            "👤 <b>Для кого создаём сайт?</b>\n\n"
-            "Напиши имя человека.\n\n"
-            "Например:\n"
-            "<i>Настя</i>",
-            f"✅ Обрано тариф: <b>{tariff_name}</b>\n"
-            f"💰 Вартість: <b>{price} грн</b>\n\n"
-            "👤 <b>Для кого створюємо сайт?</b>\n\n"
-            "Напиши ім'я людини.\n\n"
-            "Наприклад:\n"
-            "<i>Настя</i>",
-        ),
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton(
-                tr(context, "⬅️ Назад", "⬅️ Назад"),
-                callback_data="back_tariff"
-            )]
-        ]),
+        "👤 Напиши имя человека, для которого создаём сайт:"
     )
 
 
-# =========================================================
-# ИМЯ → ДАТА
-# =========================================================
+async def handle_order_text(update, context):
+    user = update.effective_user
+    save_user(user)
 
-async def ask_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["recipient_name"] = update.message.text.strip()
-    context.user_data["step"] = "date"
+    step = context.user_data.get("step")
 
-    await update.message.reply_text(
-        tr(
-            context,
-            "📅 <b>На какую дату создаём сайт?</b>\n\n"
-            "Напиши дату.\n\n"
-            "Например:\n"
-            "<i>18 сентября</i>\n\n"
-            "Если дата не важна — напиши:\n"
-            "<i>Без даты</i>",
-            "📅 <b>На яку дату створюємо сайт?</b>\n\n"
-            "Напиши дату.\n\n"
-            "Наприклад:\n"
-            "<i>18 вересня</i>\n\n"
-            "Якщо дата не важлива — напиши:\n"
-            "<i>Без дати</i>",
-        ),
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⬅️ Назад", callback_data="back_name")]
-        ]),
-    )
+    if step == "recipient":
 
+        context.user_data["order"]["recipient_name"] = (
+            update.message.text
+        )
 
-# =========================================================
-# ДАТА → ТЕКСТ
-# =========================================================
+        context.user_data["step"] = "date"
 
-async def ask_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["date"] = update.message.text.strip()
-    context.user_data["step"] = "text"
+        await update.message.reply_text(
+            "📅 Напиши дату события.\n\n"
+            "Например: 23.09.2026"
+        )
 
-    await update.message.reply_text(
-        tr(
-            context,
-            "💌 <b>Теперь самое важное — текст.</b>\n\n"
-            "Напиши, что ты хочешь видеть на сайте.\n\n"
-            "Это может быть:\n"
-            "❤️ романтическое письмо\n"
-            "🎂 поздравление\n"
-            "💍 текст предложения\n"
-            "💌 личное послание\n"
-            "🎁 описание подарка\n\n"
-            "Например:\n\n"
-            "<i>«Настя, этот день я хочу провести только "
-            "с тобой. Я подготовил для нас маленькое "
-            "приключение ❤️»</i>",
-            "💌 <b>Тепер найважливіше — текст.</b>\n\n"
-            "Напиши, що ти хочеш бачити на сайті.\n\n"
-            "Це може бути:\n"
-            "❤️ романтичний лист\n"
-            "🎂 привітання\n"
-            "💍 текст пропозиції\n"
-            "💌 особисте повідомлення\n"
-            "🎁 опис подарунка\n\n"
-            "Наприклад:\n\n"
-            "<i>«Настя, цей день я хочу провести тільки "
-            "з тобою. Я підготував для нас маленьку "
-            "приключу ❤️»</i>",
-        ),
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⬅️ Назад", callback_data="back_date")]
-        ]),
-    )
+        return
 
+    if step == "date":
 
-# =========================================================
-# ТЕКСТ → ФОТО
-# =========================================================
+        context.user_data["order"]["event_date"] = (
+            update.message.text
+        )
 
-async def ask_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["custom_text"] = update.message.text.strip()
-    context.user_data["step"] = "photos"
+        context.user_data["step"] = "text"
 
-    keyboard = [
-        [InlineKeyboardButton(
-            tr(context, "📸 Да, нужны фотографии", "📸 Так, потрібні фотографії"),
-            callback_data="photos_yes"
-        )],
-        [InlineKeyboardButton(
-            tr(context, "🚫 Нет фотографий", "🚫 Без фотографій"),
-            callback_data="photos_no"
-        )],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back_text")],
-    ]
+        await update.message.reply_text(
+            "💌 Напиши текст, который хочешь разместить "
+            "на сайте:"
+        )
 
-    await update.message.reply_text(
-        tr(
-            context,
-            "📸 <b>Добавим фотографии?</b>\n\n"
-            "Если выберешь «Да», сможешь отправить несколько фотографий.\n\n"
-            "Их можно будет красиво разместить на сайте.",
-            "📸 <b>Додамо фотографії?</b>\n\n"
-            "Якщо обереш «Так», зможеш надіслати кілька фотографій.\n\n"
-            "Їх можна буде красиво розмістити на сайті.",
-        ),
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
+        return
+
+    if step == "text":
+
+        context.user_data["order"]["custom_text"] = (
+            update.message.text
+        )
+
+        context.user_data["step"] = "photos"
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "📸 Да",
+                    callback_data="photos_yes"
+                ),
+                InlineKeyboardButton(
+                    "➡️ Нет",
+                    callback_data="photos_no"
+                )
+            ]
+        ])
+
+        await update.message.reply_text(
+            "📸 Хочешь добавить фотографии?",
+            reply_markup=keyboard
+        )
+
+        return
+
+    if step == "support":
+
+        text = update.message.text
+
+        ticket_id = create_ticket(
+            user.id,
+            user.username,
+            "ru",
+            text,
+            "support"
+        )
+
+        await update.message.reply_text(
+            f"✅ Обращение #{ticket_id} отправлено!\n\n"
+            "Мы ответим тебе здесь."
+        )
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "💬 Ответить",
+                    callback_data=f"support_reply_{ticket_id}"
+                )
+            ]
+        ])
+
+        await notify_admin(
+            f"💬 НОВОЕ ОБРАЩЕНИЕ #{ticket_id}\n\n"
+            f"👤 @{user.username or user.id}\n\n"
+            f"{text}",
+            keyboard
+        )
+
+        context.user_data.clear()
+
+        return
 
 
 # =========================================================
-# ФОТО
+# PHOTOS
 # =========================================================
 
-async def photos_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def choose_photos(update, context):
     query = update.callback_query
     await query.answer()
 
     if query.data == "photos_yes":
-        context.user_data["photos"] = True
-        context.user_data["photo_count"] = 0
         context.user_data["step"] = "upload_photos"
+        context.user_data["photo_count"] = 0
 
         await query.edit_message_text(
-            tr(
-                context,
-                "📸 <b>Отправляй фотографии</b>\n\n"
-                "Отправляй их по одной.\n\n"
-                "Когда закончишь — напиши:\n"
-                "<b>/done</b>\n\n"
-                "Можно отправить несколько фотографий.",
-                "📸 <b>Надсилай фотографії</b>\n\n"
-                "Надсилай їх по одній.\n\n"
-                "Коли закінчиш — напиши:\n"
-                "<b>/done</b>\n\n"
-                "Можна надіслати кілька фотографій.",
-            ),
-            parse_mode="HTML",
+            "📸 Отправляй фотографии по одной.\n\n"
+            "Когда закончишь — напиши /done"
         )
+
     else:
-        context.user_data["photos"] = False
-        context.user_data["photo_count"] = 0
-        await show_designs(query, context)
+        context.user_data["order"]["photo_count"] = 0
+
+        await choose_design(query, context)
 
 
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    step = context.user_data.get("step")
-
-    if step == "upload_photos":
-        context.user_data["photo_count"] = context.user_data.get("photo_count", 0) + 1
-        count = context.user_data["photo_count"]
-
-        await update.message.reply_text(
-            tr(
-                context,
-                f"📸 Фото получено!\n\nЗагружено: <b>{count}</b>\n\n"
-                "Можешь отправить ещё или написать <b>/done</b>.",
-                f"📸 Фото отримано!\n\nЗавантажено: <b>{count}</b>\n\n"
-                "Можеш надіслати ще або написати <b>/done</b>.",
-            ),
-            parse_mode="HTML",
-        )
+async def handle_photo(update, context):
+    if context.user_data.get("step") != "upload_photos":
         return
 
-    if step == "payment_receipt":
-        order_id = context.user_data.get("order_id")
+    context.user_data["photo_count"] = (
+        context.user_data.get("photo_count", 0) + 1
+    )
 
-        if not order_id:
-            await update.message.reply_text(
-                tr(context, "Не найден текущий заказ. Открой /start.", "Не знайдено поточне замовлення. Відкрий /start.")
-            )
-            return
-
-        photo = update.message.photo[-1]
-        set_receipt(order_id, photo.file_id)
-        context.user_data["step"] = "payment_review"
-
-        await update.message.reply_text(
-            tr(
-                context,
-                f"⏳ <b>Квитанция получена!</b>\n\n"
-                f"Заказ #{order_id} отправлен на проверку.\n"
-                "Ожидайте подтверждения оплаты в течение 15 минут.\n\n"
-                "Мы проверим поступление средств и сообщим вам результат здесь. 💙",
-                f"⏳ <b>Квитанцію отримано!</b>\n\n"
-                f"Замовлення #{order_id} надіслано на перевірку.\n"
-                "Очікуйте підтвердження оплати протягом 15 хвилин.\n\n"
-                "Ми перевіримо надходження коштів і повідомимо вам результат тут. 💙",
-            ),
-            parse_mode="HTML",
-        )
-
-        row = get_order(order_id)
-        if row and ADMIN_ID:
-            username = f"@{row[2]}" if row[2] else "без username"
-            admin_text = (
-                f"🧾 <b>НОВАЯ КВИТАНЦИЯ — ЗАКАЗ #{order_id}</b>\n\n"
-                f"👤 Клиент: {username}\n"
-                f"🆔 Telegram ID: <code>{row[1]}</code>\n"
-                f"🎯 Тип: {row[4]}\n"
-                f"💎 Тариф: {row[5]}\n"
-                f"💰 Сумма: {row[6]} грн\n"
-                f"👤 Для кого: {row[7]}\n"
-                f"📅 Дата: {row[8]}\n"
-                f"📸 Фото на сайте: {row[10]}\n"
-                f"🎨 Дизайн: {row[11]}\n\n"
-                f"📌 Статус: 🟠 Проверка оплаты"
-            )
-
-            await context.bot.send_photo(
-                chat_id=ADMIN_ID,
-                photo=photo.file_id,
-                caption=admin_text,
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([
-                    [
-                        InlineKeyboardButton(
-                            "✅ Оплата подтверждена",
-                            callback_data=f"pay_ok_{order_id}"
-                        )
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            "❌ Оплата не найдена",
-                            callback_data=f"pay_no_{order_id}"
-                        )
-                    ],
-                ]),
-            )
-        return
+    await update.message.reply_text(
+        f"📸 Фото #{context.user_data['photo_count']} получено."
+    )
 
 
-async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def done_photos(update, context):
     if context.user_data.get("step") != "upload_photos":
         return
 
     count = context.user_data.get("photo_count", 0)
 
-    if count == 0:
-        await update.message.reply_text(
-            tr(
-                context,
-                "📸 Ты ещё не отправил фотографии.\n\nОтправь хотя бы одну фотографию.",
-                "📸 Ти ще не надіслав фотографій.\n\nНадішли хоча б одну фотографію.",
+    context.user_data["order"]["photo_count"] = count
+
+    await choose_design(update.message, context)
+
+
+async def choose_design(message, context):
+    context.user_data["step"] = "design"
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🌑 Dark",
+                callback_data="design_dark"
             )
-        )
-        return
-
-    await update.message.reply_text(
-        tr(
-            context,
-            f"✅ Отлично! Получено фотографий: {count}",
-            f"✅ Чудово! Отримано фотографій: {count}",
-        )
-    )
-
-    await show_designs_message(update, context)
-
-
-# =========================================================
-# ДИЗАЙНЫ
-# =========================================================
-
-def design_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("💙 Love", callback_data="design_love")],
-        [InlineKeyboardButton("💜 Purple", callback_data="design_purple")],
-        [InlineKeyboardButton("🌹 Romantic", callback_data="design_romantic")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back_photos")],
+        ],
+        [
+            InlineKeyboardButton(
+                "☀️ Light",
+                callback_data="design_light"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "💜 Romantic",
+                callback_data="design_romantic"
+            )
+        ]
     ])
 
-
-async def show_designs_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["step"] = "design"
-
-    await update.message.reply_text(
-        tr(
-            context,
-            "🎨 <b>Выбери дизайн сайта</b>\n\n"
-            "💙 <b>Love</b> — нежный и романтичный\n"
-            "💜 <b>Purple</b> — фиолетовый стиль\n"
-            "🌹 <b>Romantic</b> — атмосферный дизайн",
-            "🎨 <b>Обери дизайн сайту</b>\n\n"
-            "💙 <b>Love</b> — ніжний і романтичний\n"
-            "💜 <b>Purple</b> — фіолетовий стиль\n"
-            "🌹 <b>Romantic</b> — атмосферний дизайн",
-        ),
-        parse_mode="HTML",
-        reply_markup=design_keyboard(),
+    await message.reply_text(
+        "🎨 Выбери дизайн:",
+        reply_markup=keyboard
     )
 
 
-async def show_designs(query, context):
-    context.user_data["step"] = "design"
-
-    await query.edit_message_text(
-        tr(
-            context,
-            "🎨 <b>Выбери дизайн сайта</b>\n\n"
-            "💙 <b>Love</b> — нежный и романтичный\n"
-            "💜 <b>Purple</b> — фиолетовый стиль\n"
-            "🌹 <b>Romantic</b> — атмосферный дизайн",
-            "🎨 <b>Обери дизайн сайту</b>\n\n"
-            "💙 <b>Love</b> — ніжний і романтичний\n"
-            "💜 <b>Purple</b> — фіолетовий стиль\n"
-            "🌹 <b>Romantic</b> — атмосферний дизайн",
-        ),
-        parse_mode="HTML",
-        reply_markup=design_keyboard(),
-    )
-
-
-async def choose_design(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def select_design(update, context):
     query = update.callback_query
     await query.answer()
 
-    designs_ru = {
-        "design_love": "💙 Love",
-        "design_purple": "💜 Purple",
-        "design_romantic": "🌹 Romantic",
+    designs = {
+        "design_dark": "Dark",
+        "design_light": "Light",
+        "design_romantic": "Romantic"
     }
 
-    designs_uk = {
-        "design_love": "💙 Love",
-        "design_purple": "💜 Purple",
-        "design_romantic": "🌹 Romantic",
-    }
+    context.user_data["order"]["design"] = designs[query.data]
 
-    context.user_data["design"] = (
-        designs_uk if lang(context) == "uk" else designs_ru
-    )[query.data]
+    order = context.user_data["order"]
 
-    await show_summary(query, context)
-
-
-# =========================================================
-# ИТОГ
-# =========================================================
-
-async def show_summary(query, context):
-    data = context.user_data
-    photo_count = data.get("photo_count", 0)
-
-    if lang(context) == "uk":
-        text = (
-            "📋 <b>Перевір своє замовлення</b>\n\n"
-            f"🎯 Тип: <b>{data.get('type')}</b>\n"
-            f"💎 Тариф: <b>{data.get('tariff')}</b>\n"
-            f"💰 Ціна: <b>{data.get('price')} грн</b>\n\n"
-            f"👤 Для кого: <b>{data.get('recipient_name')}</b>\n"
-            f"📅 Дата: <b>{data.get('date')}</b>\n"
-            f"📸 Фотографій: <b>{photo_count}</b>\n"
-            f"🎨 Дизайн: <b>{data.get('design')}</b>\n\n"
-            "💌 Текст додано.\n\n"
-            "Якщо все правильно — натисни «Підтвердити замовлення»."
-        )
-        confirm = "✅ Підтвердити замовлення"
-        cancel = "❌ Скасувати"
-    else:
-        text = (
-            "📋 <b>Проверь свой заказ</b>\n\n"
-            f"🎯 Тип: <b>{data.get('type')}</b>\n"
-            f"💎 Тариф: <b>{data.get('tariff')}</b>\n"
-            f"💰 Цена: <b>{data.get('price')} грн</b>\n\n"
-            f"👤 Для кого: <b>{data.get('recipient_name')}</b>\n"
-            f"📅 Дата: <b>{data.get('date')}</b>\n"
-            f"📸 Фотографий: <b>{photo_count}</b>\n"
-            f"🎨 Дизайн: <b>{data.get('design')}</b>\n\n"
-            "💌 Текст добавлен.\n\n"
-            "Если всё правильно — нажми «Подтвердить заказ»."
-        )
-        confirm = "✅ Подтвердить заказ"
-        cancel = "❌ Отменить"
-
-    keyboard = [
-        [InlineKeyboardButton(confirm, callback_data="confirm_order")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back_design")],
-        [InlineKeyboardButton(cancel, callback_data="menu")],
-    ]
-
-    await query.edit_message_text(
-        text,
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+    text = (
+        "📋 <b>Проверь заказ</b>\n\n"
+        f"💌 Тип: {order.get('site_type')}\n"
+        f"💎 Тариф: {order.get('tariff')}\n"
+        f"💰 Цена: {order.get('price')} грн\n"
+        f"👤 Имя: {order.get('recipient_name')}\n"
+        f"📅 Дата: {order.get('event_date')}\n"
+        f"📸 Фото: {order.get('photo_count', 0)}\n"
+        f"🎨 Дизайн: {order.get('design')}\n\n"
+        f"💬 Текст:\n{order.get('custom_text')}"
     )
 
-
-# =========================================================
-# ПОДТВЕРЖДЕНИЕ
-# =========================================================
-
-async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    order_id = create_order(query.from_user, context.user_data)
-    context.user_data["order_id"] = order_id
-    context.user_data["step"] = "awaiting_payment"
-
-    if lang(context) == "uk":
-        text = (
-            f"🎉 <b>Замовлення #{order_id} створено!</b>\n\n"
-            f"💎 Тариф: <b>{context.user_data.get('tariff')}</b>\n"
-            f"💰 До сплати: <b>{context.user_data.get('price')} грн</b>\n\n"
-            "💳 <b>Реквізити для оплати:</b>\n"
-            f"<code>{PAYMENT_DETAILS}</code>\n\n"
-            "Після оплати натисни кнопку «Я оплатив(ла)».\n"
-            "Потім бот попросить надіслати фото квитанції."
-        )
-        paid_btn = "💳 Я оплатив(ла)"
-    else:
-        text = (
-            f"🎉 <b>Заказ #{order_id} создан!</b>\n\n"
-            f"💎 Тариф: <b>{context.user_data.get('tariff')}</b>\n"
-            f"💰 К оплате: <b>{context.user_data.get('price')} грн</b>\n\n"
-            "💳 <b>Реквизиты для оплаты:</b>\n"
-            f"<code>{PAYMENT_DETAILS}</code>\n\n"
-            "После оплаты нажми кнопку «Я оплатил(а)».\n"
-            "Затем бот попросит отправить фото квитанции."
-        )
-        paid_btn = "💳 Я оплатил(а)"
-
-    await query.edit_message_text(
-        text,
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton(paid_btn, callback_data=f"paid_{order_id}")],
-            [InlineKeyboardButton(
-                tr(context, "📦 Мои заказы", "📦 Мої замовлення"),
-                callback_data="orders"
-            )],
-        ]),
-    )
-
-
-# =========================================================
-# ПРИМЕРЫ
-# =========================================================
-
-async def examples(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    text = tr(
-        context,
-        "👀 <b>Примеры сайтов Lunevia</b>\n\n"
-        "💙 <b>Свидание</b>\n\n"
-        "17:00 — прогулка\n"
-        "18:00 — прогулка у реки\n"
-        "19:00 — ужин\n"
-        "20:30 — прогулка по центру\n\n"
-        "После этого появляется:\n\n"
-        "🍽️ <b>«Где ты хочешь поужинать?»</b>\n\n"
-        "🔘 Rancho Grill\n"
-        "🔘 The Italian Connection\n"
-        "🔘 Tapas Lounge\n\n"
-        "После выбора владелец сайта получает уведомление в Telegram. 💙\n\n"
-        "Также можно сделать:\n"
-        "🎂 поздравление\n"
-        "💍 предложение\n"
-        "💌 годовщину\n"
-        "🎁 подарок\n"
-        "📸 фотогалерею\n"
-        "💬 вопросы и ответы\n"
-        "❤️ интерактивные кнопки",
-        "👀 <b>Приклади сайтів Lunevia</b>\n\n"
-        "💙 <b>Побачення</b>\n\n"
-        "17:00 — прогулянка\n"
-        "18:00 — прогулянка біля річки\n"
-        "19:00 — вечеря\n"
-        "20:30 — прогулянка центром\n\n"
-        "Після цього з'являється:\n\n"
-        "🍽️ <b>«Де ти хочеш повечеряти?»</b>\n\n"
-        "🔘 Rancho Grill\n"
-        "🔘 The Italian Connection\n"
-        "🔘 Tapas Lounge\n\n"
-        "Після вибору власник сайту отримує сповіщення в Telegram. 💙\n\n"
-        "Також можна зробити:\n"
-        "🎂 привітання\n"
-        "💍 пропозицію\n"
-        "💌 річницю\n"
-        "🎁 подарунок\n"
-        "📸 фотогалерею\n"
-        "💬 питання та відповіді\n"
-        "❤️ інтерактивні кнопки",
-    )
-
-    await query.edit_message_text(
-        text,
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⬅️ Назад", callback_data="menu")]
-        ]),
-    )
-
-
-# =========================================================
-# ЦЕНЫ
-# =========================================================
-
-async def prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    text = tr(
-        context,
-        "💰 <b>Тарифы Lunevia</b>\n\n"
-        f"🌙 <b>MINI — {PRICE_MINI} грн</b>\n"
-        "Для простого красивого сайта.\n\n"
-        "• персональный текст\n"
-        "• базовый дизайн\n"
-        "• анимации\n"
-        "• адаптация под телефон\n\n"
-        f"💙 <b>LOVE — {PRICE_LOVE} грн</b>\n"
-        "Для полноценного романтического сайта.\n\n"
-        "• всё из MINI\n"
-        "• фотографии\n"
-        "• интерактивные кнопки\n"
-        "• выбор ресторана\n"
-        "• дополнительные анимации\n\n"
-        f"👑 <b>PREMIUM — {PRICE_PREMIUM} грн</b>\n"
-        "Максимальная персонализация.\n\n"
-        "• всё из LOVE\n"
-        "• индивидуальная структура\n"
-        "• уникальный дизайн\n"
-        "• больше интерактивных элементов\n"
-        "• дополнительные функции",
-        "💰 <b>Тарифи Lunevia</b>\n\n"
-        f"🌙 <b>MINI — {PRICE_MINI} грн</b>\n"
-        "Для простого красивого сайту.\n\n"
-        "• персональний текст\n"
-        "• базовий дизайн\n"
-        "• анімації\n"
-        "• адаптація під телефон\n\n"
-        f"💙 <b>LOVE — {PRICE_LOVE} грн</b>\n"
-        "Для повноцінного романтичного сайту.\n\n"
-        "• усе з MINI\n"
-        "• фотографії\n"
-        "• інтерактивні кнопки\n"
-        "• вибір ресторану\n"
-        "• додаткові анімації\n\n"
-        f"👑 <b>PREMIUM — {PRICE_PREMIUM} грн</b>\n"
-        "Максимальна персоналізація.\n\n"
-        "• усе з LOVE\n"
-        "• індивідуальна структура\n"
-        "• унікальний дизайн\n"
-        "• більше інтерактивних елементів\n"
-        "• додаткові функції",
-    )
-
-    await query.edit_message_text(
-        text,
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton(
-                tr(context, "💌 Заказать сайт", "💌 Замовити сайт"),
-                callback_data="create"
-            )],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="menu")],
-        ]),
-    )
-
-
-# =========================================================
-# ПОДРОБНОЕ ОПИСАНИЕ
-# =========================================================
-
-async def description(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    text = tr(
-        context,
-        "📖 <b>Что можно сделать на сайте?</b>\n\n"
-        "Lunevia — это не просто страница с текстом. "
-        "Мы создаём небольшой персональный сайт под конкретного человека и событие. 💙\n\n"
-        "🌹 <b>Романтическая история</b>\n"
-        "Ваш текст, фотографии, красивые переходы и атмосферный дизайн.\n\n"
-        "📅 <b>План свидания</b>\n"
-        "Можно показать вечер по времени.\n\n"
-        "🍽️ <b>Выбор ресторана</b>\n"
-        "Можно предложить несколько вариантов и дать человеку выбрать.\n\n"
-        "🎁 <b>Выбор подарка</b>\n"
-        "Можно предложить несколько вариантов и узнать, что человек хочет.\n\n"
-        "💬 <b>Вопросы</b>\n"
-        "Например: «Ты согласна провести этот вечер со мной?»\n\n"
-        "📸 <b>Фотографии</b>\n"
-        "Можно добавить ваши общие фотографии.\n\n"
-        "🎵 <b>Музыка</b>\n"
-        "Можно добавить атмосферное музыкальное сопровождение.\n\n"
-        "✨ <b>Анимации</b>\n"
-        "Плавные появления текста, фотографий и кнопок.\n\n"
-        "📱 <b>Для телефона</b>\n"
-        "Сайт адаптирован под смартфоны.\n\n"
-        "💙 А в конце можно сделать специальное финальное послание.",
-        "📖 <b>Що можна зробити на сайті?</b>\n\n"
-        "Lunevia — це не просто сторінка з текстом. "
-        "Ми створюємо невеликий персональний сайт під конкретну людину та подію. 💙\n\n"
-        "🌹 <b>Романтична історія</b>\n"
-        "Ваш текст, фотографії, красиві переходи та атмосферний дизайн.\n\n"
-        "📅 <b>План побачення</b>\n"
-        "Можна показати вечір за часом.\n\n"
-        "🍽️ <b>Вибір ресторану</b>\n"
-        "Можна запропонувати кілька варіантів і дати людині обрати.\n\n"
-        "🎁 <b>Вибір подарунка</b>\n"
-        "Можна запропонувати кілька варіантів і дізнатися, що людина хоче.\n\n"
-        "💬 <b>Питання</b>\n"
-        "Наприклад: «Ти згодна провести цей вечір зі мною?»\n\n"
-        "📸 <b>Фотографії</b>\n"
-        "Можна додати ваші спільні фотографії.\n\n"
-        "🎵 <b>Музика</b>\n"
-        "Можна додати атмосферний музичний супровід.\n\n"
-        "✨ <b>Анімації</b>\n"
-        "Плавна поява тексту, фотографій та кнопок.\n\n"
-        "📱 <b>Для телефону</b>\n"
-        "Сайт адаптований під смартфони.\n\n"
-        "💙 А в кінці можна зробити спеціальне фінальне послання.",
-    )
-
-    await query.edit_message_text(
-        text,
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton(
-                tr(context, "💌 Создать сайт", "💌 Створити сайт"),
-                callback_data="create"
-            )],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="menu")],
-        ]),
-    )
-
-
-# =========================================================
-# МОИ ЗАКАЗЫ
-# =========================================================
-
-async def orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    rows = get_user_orders(query.from_user.id)
-
-    if not rows:
-        text = tr(
-            context,
-            "📦 <b>Мои заказы</b>\n\nУ тебя пока нет заказов.",
-            "📦 <b>Мої замовлення</b>\n\nУ тебе поки немає замовлень.",
-        )
-        keyboard = [
-            [InlineKeyboardButton(
-                tr(context, "💌 Создать сайт", "💌 Створити сайт"),
-                callback_data="create"
-            )],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="menu")],
-        ]
-    else:
-        lines = [tr(context, "📦 <b>МОИ ЗАКАЗЫ</b>\n", "📦 <b>МОЇ ЗАМОВЛЕННЯ</b>\n")]
-        keyboard = []
-
-        for order_id, tariff, price, status, created_at in rows:
-            lines.append(
-                f"#{order_id} — <b>{tariff}</b> — {price} грн\n"
-                f"{status_text(context, status)}"
-            )
-            keyboard.append([
-                InlineKeyboardButton(
-                    tr(context, f"📄 Заказ #{order_id}", f"📄 Замовлення #{order_id}"),
-                    callback_data=f"order_{order_id}"
-                )
-            ])
-
-        keyboard.append([
-            InlineKeyboardButton("⬅️ Назад", callback_data="menu")
-        ])
-        text = "\n\n".join(lines)
-
-    await query.edit_message_text(
-        text,
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-
-
-async def show_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    order_id = int(query.data.split("_")[1])
-    row = get_order(order_id)
-
-    if not row or row[1] != query.from_user.id:
-        await query.answer(
-            tr(context, "Заказ не найден.", "Замовлення не знайдено."),
-            show_alert=True
-        )
-        return
-
-    text = tr(
-        context,
-        f"📄 <b>Заказ #{row[0]}</b>\n\n"
-        f"🎯 Тип: <b>{row[4]}</b>\n"
-        f"💎 Тариф: <b>{row[5]}</b>\n"
-        f"💰 Цена: <b>{row[6]} грн</b>\n"
-        f"👤 Для кого: <b>{row[7]}</b>\n"
-        f"📅 Дата: <b>{row[8]}</b>\n"
-        f"📸 Фотографий: <b>{row[10]}</b>\n"
-        f"🎨 Дизайн: <b>{row[11]}</b>\n\n"
-        f"📌 Статус: <b>{status_text(context, row[12])}</b>",
-        f"📄 <b>Замовлення #{row[0]}</b>\n\n"
-        f"🎯 Тип: <b>{row[4]}</b>\n"
-        f"💎 Тариф: <b>{row[5]}</b>\n"
-        f"💰 Ціна: <b>{row[6]} грн</b>\n"
-        f"👤 Для кого: <b>{row[7]}</b>\n"
-        f"📅 Дата: <b>{row[8]}</b>\n"
-        f"📸 Фотографій: <b>{row[10]}</b>\n"
-        f"🎨 Дизайн: <b>{row[11]}</b>\n\n"
-        f"📌 Статус: <b>{status_text(context, row[12])}</b>",
-    )
-
-    keyboard = []
-
-    if row[12] in ("awaiting_payment", "payment_rejected"):
-        keyboard.append([
+    keyboard = InlineKeyboardMarkup([
+        [
             InlineKeyboardButton(
-                "💳 Я оплатив(ла)",
+                "✅ Создать заказ",
+                callback_data="confirm_order"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "❌ Отмена",
+                callback_data="menu"
+            )
+        ]
+    ])
+
+    await query.edit_message_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
+
+async def confirm_order(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    user = update.effective_user
+
+    order = context.user_data["order"]
+
+    order_id = create_order(
+        user,
+        order
+    )
+
+    context.user_data["current_order_id"] = order_id
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "💳 Я оплатил",
                 callback_data=f"paid_{order_id}"
             )
+        ]
+    ])
+
+    await query.edit_message_text(
+        f"✅ Заказ #{order_id} создан!\n\n"
+        f"💰 К оплате: {order['price']} грн\n\n"
+        f"💳 {PAYMENT_DETAILS}\n\n"
+        "После оплаты нажми кнопку ниже и отправь чек.",
+        reply_markup=keyboard
+    )
+
+    await notify_admin(
+        f"📦 НОВЫЙ ЗАКАЗ #{order_id}\n\n"
+        f"👤 @{user.username or user.id}\n"
+        f"💰 {order['price']} грн\n"
+        f"💎 {order['tariff']}"
+    )
+
+
+# =========================================================
+# RECEIPT
+# =========================================================
+
+async def paid_button(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    order_id = int(query.data.split("_")[1])
+
+    context.user_data["receipt_order"] = order_id
+    context.user_data["step"] = "receipt"
+
+    await query.message.reply_text(
+        "📸 Отправь фото чека."
+    )
+
+
+async def handle_receipt(update, context):
+    if context.user_data.get("step") != "receipt":
+        return
+
+    if not update.message.photo:
+        await update.message.reply_text(
+            "❌ Отправь именно фото чека."
+        )
+        return
+
+    order_id = context.user_data["receipt_order"]
+
+    file_id = update.message.photo[-1].file_id
+
+    set_receipt(
+        order_id,
+        file_id
+    )
+
+    context.user_data.clear()
+
+    await update.message.reply_text(
+        f"✅ Чек по заказу #{order_id} отправлен "
+        "на проверку.\n\n"
+        "Ожидай подтверждения оплаты."
+    )
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "✅ Оплатa подтверждена",
+                callback_data=f"pay_ok_{order_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "❌ Отклонить",
+                callback_data=f"pay_no_{order_id}"
+            )
+        ]
+    ])
+
+    order = get_order(order_id)
+
+    await notify_admin(
+        f"🧾 ЧЕК ПО ЗАКАЗУ #{order_id}\n\n"
+        f"💰 {order['price']} грн",
+        keyboard
+    )
+
+
+# =========================================================
+# ADMIN TELEGRAM
+# =========================================================
+
+def admin_only(user_id):
+    return user_id == ADMIN_ID
+
+
+async def admin_command(update, context):
+    if not admin_only(update.effective_user.id):
+        return
+
+    await update.message.reply_text(
+        "🛠 Lunevia Admin",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "📦 Заказы",
+                    callback_data="admin_orders"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "💬 Поддержка",
+                    callback_data="admin_support"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "📊 Статистика",
+                    callback_data="admin_stats"
+                )
+            ]
+        ])
+    )
+
+
+async def admin_orders_button(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    if not admin_only(query.from_user.id):
+        return
+
+    conn = db()
+
+    rows = conn.execute("""
+        SELECT * FROM orders
+        ORDER BY id DESC
+        LIMIT 20
+    """).fetchall()
+
+    conn.close()
+
+    if not rows:
+        await query.edit_message_text(
+            "📦 Заказов пока нет."
+        )
+        return
+
+    buttons = []
+
+    for row in rows:
+        buttons.append([
+            InlineKeyboardButton(
+                f"#{row['id']} — {row['price']} грн",
+                callback_data=f"admin_order_{row['id']}"
+            )
         ])
 
-    keyboard.append([
-        InlineKeyboardButton("⬅️ Назад", callback_data="orders")
+    await query.edit_message_text(
+        "📦 Последние заказы:",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+
+async def admin_order_button(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    if not admin_only(query.from_user.id):
+        return
+
+    order_id = int(query.data.split("_")[-1])
+
+    order = get_order(order_id)
+
+    if not order:
+        await query.edit_message_text(
+            "❌ Заказ не найден."
+        )
+        return
+
+    text = (
+        f"📦 <b>Заказ #{order_id}</b>\n\n"
+        f"👤 @{order['username'] or order['telegram_id']}\n"
+        f"💌 {order['site_type']}\n"
+        f"💎 {order['tariff']}\n"
+        f"💰 {order['price']} грн\n"
+        f"👤 Получатель: {order['recipient_name']}\n"
+        f"📅 {order['event_date']}\n"
+        f"📸 Фото: {order['photo_count']}\n"
+        f"🎨 {order['design']}\n"
+        f"📌 {status_text(order['status'])}\n\n"
+        f"💬 {order['custom_text']}"
+    )
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "💰 Оплачено",
+                callback_data=f"status_paid_{order_id}"
+            ),
+            InlineKeyboardButton(
+                "🔵 В работу",
+                callback_data=f"status_progress_{order_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🟢 Готово",
+                callback_data=f"status_ready_{order_id}"
+            )
+        ]
     ])
 
     await query.edit_message_text(
         text,
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        reply_markup=keyboard
     )
 
 
-# =========================================================
-# НАЗАД
-# =========================================================
-
-async def back_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def payment_action(update, context):
     query = update.callback_query
     await query.answer()
 
-    data = query.data
-
-    if data == "back_photos":
-        await ask_photos_back(query, context)
-
-    elif data == "back_design":
-        await show_designs(query, context)
-
-    elif data == "back_text":
-        context.user_data["step"] = "text"
-        await query.edit_message_text(
-            tr(
-                context,
-                "💌 <b>Напиши текст для сайта</b>\n\n"
-                "Можешь изменить свой текст и отправить его следующим сообщением.",
-                "💌 <b>Напиши текст для сайту</b>\n\n"
-                "Можеш змінити свій текст і надіслати його наступним повідомленням.",
-            ),
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ Назад", callback_data="back_date")]
-            ]),
-        )
-
-    elif data == "back_date":
-        context.user_data["step"] = "date"
-        await query.edit_message_text(
-            tr(
-                context,
-                "📅 <b>На какую дату создаём сайт?</b>\n\nНапиши дату.",
-                "📅 <b>На яку дату створюємо сайт?</b>\n\nНапиши дату.",
-            ),
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ Назад", callback_data="back_name")]
-            ]),
-        )
-
-    elif data == "back_name":
-        context.user_data["step"] = "recipient_name"
-        await query.edit_message_text(
-            tr(
-                context,
-                "👤 <b>Для кого создаём сайт?</b>\n\nНапиши имя человека.",
-                "👤 <b>Для кого створюємо сайт?</b>\n\nНапиши ім'я людини.",
-            ),
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ Назад", callback_data="back_tariff")]
-            ]),
-        )
-
-    elif data == "back_tariff":
-        await show_tariffs(query, context)
-
-    elif data == "back_type":
-        await start_order(update, context)
-
-
-async def ask_photos_back(query, context):
-    context.user_data["step"] = "photos"
-
-    keyboard = [
-        [InlineKeyboardButton(
-            tr(context, "📸 Да, нужны фотографии", "📸 Так, потрібні фотографії"),
-            callback_data="photos_yes"
-        )],
-        [InlineKeyboardButton(
-            tr(context, "🚫 Нет фотографий", "🚫 Без фотографій"),
-            callback_data="photos_no"
-        )],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back_text")],
-    ]
-
-    await query.edit_message_text(
-        tr(
-            context,
-            "📸 <b>Добавим фотографии?</b>",
-            "📸 <b>Додамо фотографії?</b>",
-        ),
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-
-
-
-# =========================================================
-# ОПЛАТА
-# =========================================================
-
-async def paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    order_id = int(query.data.split("_")[1])
-    row = get_order(order_id)
-
-    if not row or row[1] != query.from_user.id:
-        await query.answer(
-            tr(context, "Заказ не найден.", "Замовлення не знайдено."),
-            show_alert=True
-        )
+    if not admin_only(query.from_user.id):
         return
-
-    if row[12] not in ("awaiting_payment", "payment_rejected"):
-        await query.edit_message_text(
-            tr(
-                context,
-                f"📌 Заказ #{order_id} уже находится в статусе:\n<b>{status_text(context, row[12])}</b>",
-                f"📌 Замовлення #{order_id} вже має статус:\n<b>{status_text(context, row[12])}</b>",
-            ),
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ Назад", callback_data="orders")]
-            ]),
-        )
-        return
-
-    context.user_data["order_id"] = order_id
-    context.user_data["step"] = "payment_receipt"
-
-    await query.edit_message_text(
-        tr(
-            context,
-            f"📸 <b>Отправь фото квитанции</b>\n\n"
-            f"Заказ: <b>#{order_id}</b>\n"
-            "Отправь сюда скриншот или фото подтверждения оплаты.\n\n"
-            "После этого мы проверим оплату вручную. 💙",
-            f"📸 <b>Надішли фото квитанції</b>\n\n"
-            f"Замовлення: <b>#{order_id}</b>\n"
-            "Надішли сюди скриншот або фото підтвердження оплати.\n\n"
-            "Після цього ми перевіримо оплату вручну. 💙",
-        ),
-        parse_mode="HTML",
-    )
-
-
-async def admin_payment_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-
-    if query.from_user.id != ADMIN_ID:
-        await query.answer("Нет доступа.", show_alert=True)
-        return
-
-    await query.answer()
 
     parts = query.data.split("_")
     action = parts[1]
     order_id = int(parts[2])
 
-    row = get_order(order_id)
-    if not row:
-        await query.edit_message_caption(caption="❌ Заказ не найден.")
-        return
-
-    customer_id = row[1]
-
     if action == "ok":
-        set_status(order_id, "in_progress")
+        set_status(order_id, "paid")
 
-        await context.bot.send_message(
-            chat_id=customer_id,
-            text=tr(
-                context,
-                f"🎉 <b>Оплата заказа #{order_id} прошла успешно!</b>\n\n"
-                "Ваш сайт уже в процессе создания. 💙\n"
-                "Мы сообщим вам здесь, когда он будет готов.",
-                f"🎉 <b>Оплата замовлення #{order_id} пройшла успішно!</b>\n\n"
-                "Ваш сайт уже в процесі створення. 💙\n"
-                "Ми повідомимо вам тут, коли він буде готовий.",
-            ),
-            parse_mode="HTML",
+        order = get_order(order_id)
+
+        await send_telegram_message(
+            order["telegram_id"],
+            f"✅ Оплата по заказу #{order_id} подтверждена!\n\n"
+            "Теперь заказ передан в работу."
         )
 
-        await query.edit_message_caption(
-            caption=f"✅ <b>Оплата заказа #{order_id} подтверждена.</b>\n\nСтатус: 🔵 В процессе",
-            parse_mode="HTML",
+        await query.edit_message_text(
+            f"✅ Оплата заказа #{order_id} подтверждена."
         )
 
     else:
         set_status(order_id, "payment_rejected")
 
-        await context.bot.send_message(
-            chat_id=customer_id,
-            text=tr(
-                context,
-                f"❌ <b>Оплата заказа #{order_id} не подтверждена.</b>\n\n"
-                "Мы не смогли подтвердить поступление средств.\n"
-                "Попробуйте оплатить ещё раз или свяжитесь с нами:\n"
-                f"{SUPPORT_USERNAME}",
-                f"❌ <b>Оплату замовлення #{order_id} не підтверджено.</b>\n\n"
-                "Ми не змогли підтвердити надходження коштів.\n"
-                "Спробуйте оплатити ще раз або зв'яжіться з нами:\n"
-                f"{SUPPORT_USERNAME}",
-            ),
-            parse_mode="HTML",
+        order = get_order(order_id)
+
+        await send_telegram_message(
+            order["telegram_id"],
+            f"❌ Оплата по заказу #{order_id} отклонена.\n\n"
+            "Проверь чек и отправь его повторно."
         )
 
-        await query.edit_message_caption(
-            caption=f"❌ <b>Оплата заказа #{order_id} не найдена.</b>\n\nСтатус: 🔴 Оплата не подтверждена",
-            parse_mode="HTML",
+        await query.edit_message_text(
+            f"❌ Оплата заказа #{order_id} отклонена."
         )
 
 
-# =========================================================
-# ПОДДЕРЖКА И АДМИН-ПАНЕЛЬ
-# =========================================================
-
-async def support_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin_status_button(update, context):
     query = update.callback_query
     await query.answer()
-    context.user_data["step"] = "support"
-    await query.edit_message_text(
-        tr(
-            context,
-            "🆘 <b>Поддержка Lunevia</b>\n\n"
-            "Напиши свой вопрос одним сообщением.\n"
-            "Мы передадим его администратору и ответим здесь. 💙",
-            "🆘 <b>Підтримка Lunevia</b>\n\n"
-            "Напиши своє питання одним повідомленням.\n"
-            "Ми передамо його адміністратору та відповімо тут. 💙",
-        ),
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⬅️ Назад", callback_data="menu")]
-        ]),
-    )
 
-
-async def send_support_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    question = update.message.text.strip()
-    if not question:
-        return
-
-    user = update.effective_user
-    username = f"@{user.username}" if user.username else "без username"
-
-    if ADMIN_ID:
-        admin_text = (
-            "🆘 <b>НОВЫЙ ВОПРОС В ПОДДЕРЖКУ</b>\n\n"
-            f"👤 Клиент: {username}\n"
-            f"🆔 Telegram ID: <code>{user.id}</code>\n\n"
-            f"💬 <b>Вопрос:</b>\n{question}"
-        )
-        await context.bot.send_message(
-            chat_id=ADMIN_ID,
-            text=admin_text,
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("💬 Ответить", callback_data=f"support_reply_{user.id}")],
-                [InlineKeyboardButton("❌ Закрыть", callback_data=f"support_close_{user.id}")],
-            ]),
-        )
-
-    context.user_data["step"] = None
-    await update.message.reply_text(
-        tr(
-            context,
-            "✅ Вопрос отправлен в поддержку!\n\nМы ответим тебе здесь. 💙",
-            "✅ Питання надіслано в підтримку!\n\nМи відповімо тобі тут. 💙",
-        ),
-        reply_markup=main_menu(context),
-    )
-
-
-def admin_only(user_id):
-    return user_id == ADMIN_ID and ADMIN_ID != 0
-
-
-def admin_menu_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📦 Все заказы", callback_data="admin_orders_all")],
-        [InlineKeyboardButton("🟠 Проверка оплаты", callback_data="admin_orders_review")],
-        [InlineKeyboardButton("🔵 В работе", callback_data="admin_orders_progress")],
-        [InlineKeyboardButton("🟢 Готовые", callback_data="admin_orders_ready")],
-        [InlineKeyboardButton("📊 Статистика", callback_data="admin_stats")],
-    ])
-
-
-async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not admin_only(update.effective_user.id):
-        await update.message.reply_text("❌ Нет доступа.")
-        return
-    await update.message.reply_text(
-        "👑 <b>Админ-панель Lunevia</b>\n\nВыбери раздел:",
-        parse_mode="HTML",
-        reply_markup=admin_menu_keyboard(),
-    )
-
-
-def admin_orders(status=None):
-    conn = db_connect()
-    cur = conn.cursor()
-    if status:
-        cur.execute(
-            "SELECT id, telegram_id, username, tariff, price, recipient_name, status, created_at "
-            "FROM orders WHERE status = ? ORDER BY id DESC LIMIT 30",
-            (status,),
-        )
-    else:
-        cur.execute(
-            "SELECT id, telegram_id, username, tariff, price, recipient_name, status, created_at "
-            "FROM orders ORDER BY id DESC LIMIT 30"
-        )
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-
-async def admin_orders_view(update: Update, context: ContextTypes.DEFAULT_TYPE, status=None):
-    query = update.callback_query
-    await query.answer()
     if not admin_only(query.from_user.id):
-        await query.answer("Нет доступа.", show_alert=True)
         return
 
-    rows = admin_orders(status)
-    title = {
-        None: "📦 <b>Все заказы</b>",
-        "payment_review": "🟠 <b>Проверка оплаты</b>",
-        "in_progress": "🔵 <b>Заказы в работе</b>",
-        "ready": "🟢 <b>Готовые заказы</b>",
-    }[status]
-
-    if not rows:
-        text = title + "\n\nНет заказов."
-        keyboard = [[InlineKeyboardButton("⬅️ Админ-панель", callback_data="admin_panel")]]
-    else:
-        lines = [title + "\n"]
-        keyboard = []
-        for order_id, tg_id, username, tariff, price, recipient, st, created in rows:
-            display_user = f"@{username}" if username else str(tg_id)
-            lines.append(
-                f"<b>#{order_id}</b> — {tariff} — {price} грн\n"
-                f"👤 {display_user} → {recipient}\n"
-                f"📌 {status_text(context, st)}"
-            )
-            keyboard.append([
-                InlineKeyboardButton(f"📄 Заказ #{order_id}", callback_data=f"admin_order_{order_id}")
-            ])
-        keyboard.append([InlineKeyboardButton("⬅️ Админ-панель", callback_data="admin_panel")])
-        text = "\n\n".join(lines)
-
-    await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
-
-
-async def admin_order_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not admin_only(query.from_user.id):
-        await query.answer("Нет доступа.", show_alert=True)
-        return
-
-    order_id = int(query.data.rsplit("_", 1)[1])
-    row = get_order(order_id)
-    if not row:
-        await query.edit_message_text("❌ Заказ не найден.", reply_markup=admin_menu_keyboard())
-        return
-
-    username = f"@{row[2]}" if row[2] else "без username"
-    text = (
-        f"📄 <b>ЗАКАЗ #{row[0]}</b>\n\n"
-        f"👤 Клиент: {username}\n"
-        f"🆔 Telegram ID: <code>{row[1]}</code>\n"
-        f"🎯 Тип: <b>{row[4]}</b>\n"
-        f"💎 Тариф: <b>{row[5]}</b>\n"
-        f"💰 Цена: <b>{row[6]} грн</b>\n"
-        f"👤 Для кого: <b>{row[7]}</b>\n"
-        f"📅 Дата: <b>{row[8]}</b>\n"
-        f"📸 Фото: <b>{row[10]}</b>\n"
-        f"🎨 Дизайн: <b>{row[11]}</b>\n"
-        f"📌 Статус: <b>{status_text(context, row[12])}</b>\n\n"
-        f"💌 <b>Текст:</b>\n{row[9] or '—'}"
-    )
-
-    keyboard = [
-        [InlineKeyboardButton("💬 Написать клиенту", callback_data=f"admin_msg_{row[1]}")],
-        [InlineKeyboardButton("🔵 В работу", callback_data=f"admin_status_in_progress_{order_id}"),
-         InlineKeyboardButton("🟢 Готово", callback_data=f"admin_status_ready_{order_id}")],
-        [InlineKeyboardButton("⚫ Отменить", callback_data=f"admin_status_cancelled_{order_id}")],
-        [InlineKeyboardButton("⬅️ Админ-панель", callback_data="admin_panel")],
-    ]
-    await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
-
-
-async def admin_set_order_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if not admin_only(query.from_user.id):
-        await query.answer("Нет доступа.", show_alert=True)
-        return
     parts = query.data.split("_")
-    status = parts[2]
-    order_id = int(parts[3])
-    row = get_order(order_id)
-    if not row:
-        await query.answer("Заказ не найден.", show_alert=True)
+
+    status_name = parts[1]
+    order_id = int(parts[2])
+
+    statuses = {
+        "paid": "paid",
+        "progress": "in_progress",
+        "ready": "ready"
+    }
+
+    status = statuses.get(status_name)
+
+    if not status:
         return
-    set_status(order_id, status)
-    await query.answer("Статус обновлён")
-    await context.bot.send_message(
-        chat_id=row[1],
-        text=(
-            f"📌 <b>Статус заказа #{order_id} изменён</b>\n\n"
-            f"Новый статус: <b>{status_text(context, status)}</b>"
-        ),
-        parse_mode="HTML",
+
+    set_status(
+        order_id,
+        status
     )
-    await admin_order_view(update, context)
+
+    order = get_order(order_id)
+
+    await send_telegram_message(
+        order["telegram_id"],
+        f"📦 Статус заказа #{order_id} изменён:\n\n"
+        f"{status_text(status)}"
+    )
+
+    await query.edit_message_text(
+        f"✅ Заказ #{order_id}\n"
+        f"Статус: {status_text(status)}"
+    )
 
 
-async def admin_stats_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# =========================================================
+# USER ORDERS
+# =========================================================
+
+async def my_orders(update, context):
     query = update.callback_query
     await query.answer()
-    if not admin_only(query.from_user.id):
-        await query.answer("Нет доступа.", show_alert=True)
+
+    orders = get_user_orders(
+        query.from_user.id
+    )
+
+    if not orders:
+        await query.edit_message_text(
+            "📦 У тебя пока нет заказов.",
+            reply_markup=main_menu()
+        )
         return
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM orders")
-    total = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM orders WHERE status = 'payment_review'")
-    review = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM orders WHERE status = 'in_progress'")
-    progress = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM orders WHERE status = 'ready'")
-    ready = cur.fetchone()[0]
-    cur.execute("SELECT COALESCE(SUM(price), 0) FROM orders WHERE status IN ('paid','in_progress','ready')")
-    revenue = cur.fetchone()[0]
+
+    buttons = []
+
+    for order in orders:
+        buttons.append([
+            InlineKeyboardButton(
+                f"#{order['id']} • {status_text(order['status'])}",
+                callback_data=f"user_order_{order['id']}"
+            )
+        ])
+
+    await query.edit_message_text(
+        "📦 Твои заказы:",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+
+async def user_order(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    order_id = int(query.data.split("_")[-1])
+
+    order = get_order(order_id)
+
+    if not order or order["telegram_id"] != query.from_user.id:
+        return
+
+    await query.edit_message_text(
+        f"📦 Заказ #{order_id}\n\n"
+        f"💎 Тариф: {order['tariff']}\n"
+        f"💰 Цена: {order['price']} грн\n"
+        f"📌 Статус: {status_text(order['status'])}\n"
+        f"📅 Дата: {order['event_date']}\n"
+        f"🎨 Дизайн: {order['design']}",
+        reply_markup=main_menu()
+    )
+
+
+# =========================================================
+# SUPPORT
+# =========================================================
+
+async def support(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data["step"] = "support"
+
+    await query.edit_message_text(
+        "💬 Поддержка\n\n"
+        "Напиши свой вопрос одним сообщением.\n"
+        "Администратор ответит тебе здесь."
+    )
+
+
+# =========================================================
+# OTHER MENU
+# =========================================================
+
+async def prices(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    await query.edit_message_text(
+        "💰 <b>Тарифы Lunevia</b>\n\n"
+        "🌙 Mini — 299 грн\n"
+        "❤️ Love — 499 грн\n"
+        "👑 Premium — 899 грн",
+        parse_mode="HTML",
+        reply_markup=main_menu()
+    )
+
+
+async def examples(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    await query.edit_message_text(
+        "👀 Примеры сайтов:\n\n"
+        "Скоро здесь появится галерея готовых работ.",
+        reply_markup=main_menu()
+    )
+
+
+async def about(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    await query.edit_message_text(
+        "❤️ <b>Lunevia</b>\n\n"
+        "Создаём персональные сайты, которые "
+        "можно подарить любимому человеку.\n\n"
+        "Красиво. Персонально. С душой.",
+        parse_mode="HTML",
+        reply_markup=main_menu()
+    )
+
+
+# =========================================================
+# WEB ADMIN
+# =========================================================
+
+app = Flask(__name__)
+app.secret_key = SECRET_KEY
+
+
+BASE_STYLE = """
+<style>
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    background: #0b0d12;
+    color: #f5f5f5;
+    font-family: Arial, sans-serif;
+}
+
+a {
+    color: inherit;
+    text-decoration: none;
+}
+
+.nav {
+    height: 64px;
+    background: #11141b;
+    border-bottom: 1px solid #242936;
+    display: flex;
+    align-items: center;
+    padding: 0 24px;
+    gap: 25px;
+}
+
+.logo {
+    font-size: 22px;
+    font-weight: 700;
+}
+
+.nav a {
+    color: #aeb4c2;
+}
+
+.nav a:hover {
+    color: white;
+}
+
+.container {
+    max-width: 1250px;
+    margin: 30px auto;
+    padding: 0 20px;
+}
+
+.card {
+    background: #11141b;
+    border: 1px solid #242936;
+    border-radius: 14px;
+    padding: 20px;
+    margin-bottom: 20px;
+}
+
+.grid {
+    display: grid;
+    grid-template-columns:
+        repeat(auto-fit, minmax(220px, 1fr));
+    gap: 16px;
+}
+
+.stat {
+    background: #161a22;
+    border: 1px solid #272d39;
+    border-radius: 14px;
+    padding: 20px;
+}
+
+.stat b {
+    display: block;
+    font-size: 30px;
+    margin-top: 8px;
+}
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+}
+
+th, td {
+    text-align: left;
+    padding: 13px;
+    border-bottom: 1px solid #272d39;
+}
+
+th {
+    color: #858d9d;
+}
+
+.btn {
+    display: inline-block;
+    border: 0;
+    border-radius: 9px;
+    padding: 10px 14px;
+    background: #252b38;
+    color: white;
+    cursor: pointer;
+}
+
+.btn:hover {
+    background: #323a4a;
+}
+
+.btn-green {
+    background: #176b45;
+}
+
+.btn-red {
+    background: #8e2930;
+}
+
+.btn-blue {
+    background: #24528c;
+}
+
+input, textarea, select {
+    width: 100%;
+    background: #0c0f15;
+    border: 1px solid #303746;
+    color: white;
+    padding: 12px;
+    border-radius: 8px;
+    margin: 7px 0 15px;
+}
+
+.message {
+    background: #181d27;
+    padding: 13px;
+    border-radius: 10px;
+    margin: 10px 0;
+}
+
+.user-message {
+    border-left: 3px solid #5574ff;
+}
+
+.admin-message {
+    border-left: 3px solid #35b878;
+}
+
+.status {
+    padding: 5px 9px;
+    background: #222835;
+    border-radius: 20px;
+    font-size: 12px;
+}
+
+.login {
+    max-width: 400px;
+    margin: 100px auto;
+}
+
+@media(max-width:700px) {
+    .nav {
+        overflow-x: auto;
+    }
+
+    table {
+        font-size: 13px;
+    }
+
+    th:nth-child(1),
+    td:nth-child(1) {
+        display: none;
+    }
+}
+</style>
+"""
+
+
+def admin_required(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        if not session.get("admin"):
+            return redirect(url_for("login"))
+        return func(*args, **kwargs)
+
+    return wrapper
+
+
+@app.route("/")
+def index():
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/admin/login", methods=["GET", "POST"])
+def login():
+
+    if request.method == "POST":
+
+        username = request.form.get("username")
+        password = request.form.get("password")
+
+        if (
+            username == ADMIN_USERNAME
+            and password == ADMIN_PASSWORD
+        ):
+            session["admin"] = True
+            return redirect(url_for("dashboard"))
+
+        flash("Неверный логин или пароль")
+
+    return render_template_string(
+        BASE_STYLE + """
+        <div class="login card">
+            <h1>🌙 Lunevia Admin</h1>
+
+            <form method="POST">
+                <label>Логин</label>
+                <input name="username">
+
+                <label>Пароль</label>
+                <input name="password" type="password">
+
+                <button class="btn btn-blue">
+                    Войти
+                </button>
+            </form>
+        </div>
+        """
+    )
+
+
+@app.route("/admin/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+
+@app.route("/admin")
+@admin_required
+def dashboard():
+
+    conn = db()
+
+    total = conn.execute(
+        "SELECT COUNT(*) FROM orders"
+    ).fetchone()[0]
+
+    review = conn.execute(
+        "SELECT COUNT(*) FROM orders WHERE status='payment_review'"
+    ).fetchone()[0]
+
+    progress = conn.execute(
+        "SELECT COUNT(*) FROM orders WHERE status='in_progress'"
+    ).fetchone()[0]
+
+    ready = conn.execute(
+        "SELECT COUNT(*) FROM orders WHERE status='ready'"
+    ).fetchone()[0]
+
+    revenue = conn.execute(
+        """
+        SELECT COALESCE(SUM(price), 0)
+        FROM orders
+        WHERE status IN ('paid', 'in_progress', 'ready')
+        """
+    ).fetchone()[0]
+
+    tickets = conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM support_tickets
+        WHERE status='open'
+        """
+    ).fetchone()[0]
+
     conn.close()
 
-    text = (
-        "📊 <b>Статистика Lunevia</b>\n\n"
-        f"📦 Всего заказов: <b>{total}</b>\n"
-        f"🟠 На проверке: <b>{review}</b>\n"
-        f"🔵 В работе: <b>{progress}</b>\n"
-        f"🟢 Готово: <b>{ready}</b>\n"
-        f"💰 Оплачено/в работе: <b>{revenue} грн</b>"
+    return render_template_string(
+        BASE_STYLE + """
+        <div class="nav">
+            <div class="logo">🌙 Lunevia</div>
+            <a href="/admin">Главная</a>
+            <a href="/admin/orders">Заказы</a>
+            <a href="/admin/support">Поддержка</a>
+            <a href="/admin/notifications">Уведомления</a>
+            <a href="/admin/logout">Выйти</a>
+        </div>
+
+        <div class="container">
+            <h1>Панель управления</h1>
+
+            <div class="grid">
+
+                <div class="stat">
+                    📦 Заказов
+                    <b>{{ total }}</b>
+                </div>
+
+                <div class="stat">
+                    🟠 Проверка оплаты
+                    <b>{{ review }}</b>
+                </div>
+
+                <div class="stat">
+                    🔵 В работе
+                    <b>{{ progress }}</b>
+                </div>
+
+                <div class="stat">
+                    🟢 Готовые
+                    <b>{{ ready }}</b>
+                </div>
+
+                <div class="stat">
+                    💰 Выручка
+                    <b>{{ revenue }} грн</b>
+                </div>
+
+                <div class="stat">
+                    💬 Открытые обращения
+                    <b>{{ tickets }}</b>
+                </div>
+
+            </div>
+        </div>
+        """,
+        total=total,
+        review=review,
+        progress=progress,
+        ready=ready,
+        revenue=revenue,
+        tickets=tickets
     )
-    await query.edit_message_text(
-        text,
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⬅️ Админ-панель", callback_data="admin_panel")]
-        ]),
+
+
+@app.route("/admin/orders")
+@admin_required
+def admin_orders_page():
+
+    status = request.args.get("status")
+
+    conn = db()
+
+    if status:
+        orders = conn.execute(
+            """
+            SELECT * FROM orders
+            WHERE status=?
+            ORDER BY id DESC
+            """,
+            (status,)
+        ).fetchall()
+    else:
+        orders = conn.execute(
+            """
+            SELECT * FROM orders
+            ORDER BY id DESC
+            """
+        ).fetchall()
+
+    conn.close()
+
+    return render_template_string(
+        BASE_STYLE + """
+        <div class="nav">
+            <div class="logo">🌙 Lunevia</div>
+            <a href="/admin">Главная</a>
+            <a href="/admin/orders">Заказы</a>
+            <a href="/admin/support">Поддержка</a>
+            <a href="/admin/notifications">Уведомления</a>
+            <a href="/admin/logout">Выйти</a>
+        </div>
+
+        <div class="container">
+
+        <h1>📦 Заказы</h1>
+
+        <div class="card">
+            <a class="btn" href="/admin/orders">Все</a>
+            <a class="btn" href="/admin/orders?status=payment_review">
+                Проверка оплаты
+            </a>
+            <a class="btn" href="/admin/orders?status=in_progress">
+                В работе
+            </a>
+            <a class="btn" href="/admin/orders?status=ready">
+                Готовые
+            </a>
+        </div>
+
+        <div class="card">
+        <table>
+
+        <tr>
+            <th>ID</th>
+            <th>Клиент</th>
+            <th>Тариф</th>
+            <th>Цена</th>
+            <th>Статус</th>
+            <th></th>
+        </tr>
+
+        {% for order in orders %}
+
+        <tr>
+            <td>#{{ order.id }}</td>
+            <td>
+                @{{ order.username or order.telegram_id }}
+            </td>
+            <td>{{ order.tariff }}</td>
+            <td>{{ order.price }} грн</td>
+            <td>
+                <span class="status">
+                    {{ status_text(order.status) }}
+                </span>
+            </td>
+            <td>
+                <a class="btn"
+                   href="/admin/orders/{{ order.id }}">
+                    Открыть
+                </a>
+            </td>
+        </tr>
+
+        {% endfor %}
+
+        </table>
+        </div>
+
+        </div>
+        """,
+        orders=orders,
+        status_text=status_text
     )
 
 
-async def admin_start_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if not admin_only(query.from_user.id):
-        await query.answer("Нет доступа.", show_alert=True)
-        return
-    user_id = int(query.data.rsplit("_", 1)[1])
-    context.user_data["step"] = "admin_reply"
-    context.user_data["reply_to_user"] = user_id
-    await query.answer()
-    await query.message.reply_text(
-        f"💬 Напиши сообщение для пользователя <code>{user_id}</code> одним сообщением.",
-        parse_mode="HTML",
+@app.route("/admin/orders/<int:order_id>")
+@admin_required
+def admin_order_page(order_id):
+
+    order = get_order(order_id)
+
+    if not order:
+        return "Заказ не найден", 404
+
+    return render_template_string(
+        BASE_STYLE + """
+        <div class="nav">
+            <div class="logo">🌙 Lunevia</div>
+            <a href="/admin">Главная</a>
+            <a href="/admin/orders">Заказы</a>
+            <a href="/admin/support">Поддержка</a>
+            <a href="/admin/logout">Выйти</a>
+        </div>
+
+        <div class="container">
+
+        <h1>📦 Заказ #{{ order.id }}</h1>
+
+        <div class="card">
+
+            <h2>Информация</h2>
+
+            <p>👤 Клиент:
+                @{{ order.username or order.telegram_id }}
+            </p>
+
+            <p>💌 Тип: {{ order.site_type }}</p>
+            <p>💎 Тариф: {{ order.tariff }}</p>
+            <p>💰 Цена: {{ order.price }} грн</p>
+            <p>👤 Получатель: {{ order.recipient_name }}</p>
+            <p>📅 Дата: {{ order.event_date }}</p>
+            <p>📸 Фото: {{ order.photo_count }}</p>
+            <p>🎨 Дизайн: {{ order.design }}</p>
+            <p>📌 Статус:
+                <b>{{ status_text(order.status) }}</b>
+            </p>
+
+            <hr>
+
+            <h3>💬 Текст</h3>
+
+            <div class="message">
+                {{ order.custom_text }}
+            </div>
+
+        </div>
+
+        {% if order.receipt_file_id %}
+
+        <div class="card">
+
+            <h2>🧾 Чек отправлен</h2>
+
+            <p>
+                Чек сохранён в Telegram.
+                Открой Telegram-админку для просмотра
+                изображения.
+            </p>
+
+        </div>
+
+        {% endif %}
+
+        <div class="card">
+
+            <h2>Изменить статус</h2>
+
+            <form method="POST"
+                  action="/admin/orders/{{ order.id }}/status">
+
+                <select name="status">
+
+                    <option value="awaiting_payment">
+                        Ожидает оплаты
+                    </option>
+
+                    <option value="payment_review">
+                        Проверка оплаты
+                    </option>
+
+                    <option value="paid">
+                        Оплачено
+                    </option>
+
+                    <option value="in_progress">
+                        В работе
+                    </option>
+
+                    <option value="ready">
+                        Готово
+                    </option>
+
+                    <option value="payment_rejected">
+                        Оплата отклонена
+                    </option>
+
+                    <option value="cancelled">
+                        Отменён
+                    </option>
+
+                </select>
+
+                <button class="btn btn-blue">
+                    Сохранить
+                </button>
+
+            </form>
+
+        </div>
+
+        </div>
+        """,
+        order=order,
+        status_text=status_text
     )
 
 
-async def admin_send_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = context.user_data.get("reply_to_user")
-    if not user_id or not admin_only(update.effective_user.id):
-        return
-    text = update.message.text.strip()
-    await context.bot.send_message(
-        chat_id=user_id,
-        text=f"💬 <b>Сообщение от Lunevia</b>\n\n{text}",
-        parse_mode="HTML",
+@app.route(
+    "/admin/orders/<int:order_id>/status",
+    methods=["POST"]
+)
+@admin_required
+def admin_change_status(order_id):
+
+    status = request.form.get("status")
+
+    allowed = {
+        "awaiting_payment",
+        "payment_review",
+        "paid",
+        "in_progress",
+        "ready",
+        "payment_rejected",
+        "cancelled"
+    }
+
+    if status not in allowed:
+        return redirect(
+            url_for(
+                "admin_order_page",
+                order_id=order_id
+            )
+        )
+
+    set_status(
+        order_id,
+        status
     )
-    context.user_data["step"] = None
-    context.user_data.pop("reply_to_user", None)
-    await update.message.reply_text("✅ Сообщение отправлено клиенту.")
+
+    order = get_order(order_id)
+
+    if order:
+        # Flask работает в отдельном потоке,
+        # поэтому запускаем отдельный asyncio loop.
+        try:
+            asyncio.run(
+                send_telegram_message(
+                    order["telegram_id"],
+                    f"📦 Статус заказа #{order_id}:\n\n"
+                    f"{status_text(status)}"
+                )
+            )
+        except Exception as e:
+            print(e)
+
+    return redirect(
+        url_for(
+            "admin_order_page",
+            order_id=order_id
+        )
+    )
 
 
-async def admin_close_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if not admin_only(query.from_user.id):
-        await query.answer("Нет доступа.", show_alert=True)
-        return
-    await query.answer("Закрыто")
-    await query.edit_message_text("✅ Обращение закрыто.")
+@app.route("/admin/support")
+@admin_required
+def admin_support_page():
+
+    conn = db()
+
+    tickets = conn.execute("""
+        SELECT * FROM support_tickets
+        ORDER BY
+            CASE WHEN status='open' THEN 0 ELSE 1 END,
+            updated_at DESC
+    """).fetchall()
+
+    conn.close()
+
+    return render_template_string(
+        BASE_STYLE + """
+        <div class="nav">
+            <div class="logo">🌙 Lunevia</div>
+            <a href="/admin">Главная</a>
+            <a href="/admin/orders">Заказы</a>
+            <a href="/admin/support">Поддержка</a>
+            <a href="/admin/notifications">Уведомления</a>
+            <a href="/admin/logout">Выйти</a>
+        </div>
+
+        <div class="container">
+
+        <h1>💬 Поддержка</h1>
+
+        {% for ticket in tickets %}
+
+        <div class="card">
+
+            <h3>
+                #{{ ticket.id }}
+                —
+                {{ ticket.subject }}
+            </h3>
+
+            <p>
+                👤 @{{ ticket.username or ticket.telegram_id }}
+            </p>
+
+            <p>
+                📌 {{ ticket.status }}
+            </p>
+
+            <a class="btn btn-blue"
+               href="/admin/support/{{ ticket.id }}">
+                Открыть диалог
+            </a>
+
+        </div>
+
+        {% endfor %}
+
+        </div>
+        """,
+        tickets=tickets
+    )
+
+
+@app.route("/admin/support/<int:ticket_id>")
+@admin_required
+def admin_ticket_page(ticket_id):
+
+    ticket = get_ticket(ticket_id)
+
+    if not ticket:
+        return "Обращение не найдено", 404
+
+    messages = get_ticket_messages(ticket_id)
+
+    return render_template_string(
+        BASE_STYLE + """
+        <div class="nav">
+            <div class="logo">🌙 Lunevia</div>
+            <a href="/admin">Главная</a>
+            <a href="/admin/orders">Заказы</a>
+            <a href="/admin/support">Поддержка</a>
+            <a href="/admin/logout">Выйти</a>
+        </div>
+
+        <div class="container">
+
+        <h1>💬 Обращение #{{ ticket.id }}</h1>
+
+        <div class="card">
+
+        {% for message in messages %}
+
+            <div class="
+                message
+                {% if message.sender_type == 'user' %}
+                    user-message
+                {% else %}
+                    admin-message
+                {% endif %}
+            ">
+
+                <b>
+                {% if message.sender_type == 'user' %}
+                    👤 Клиент
+                {% else %}
+                    🛠 Администратор
+                {% endif %}
+                </b>
+
+                <p>{{ message.text }}</p>
+
+                <small>
+                    {{ message.created_at }}
+                </small>
+
+            </div>
+
+        {% endfor %}
+
+        </div>
+
+        {% if ticket.status == 'open' %}
+
+        <div class="card">
+
+            <form method="POST"
+                  action="/admin/support/{{ ticket.id }}/reply">
+
+                <textarea
+                    name="text"
+                    rows="5"
+                    placeholder="Напиши ответ клиенту..."
+                    required></textarea>
+
+                <button class="btn btn-green">
+                    💬 Отправить ответ
+                </button>
+
+            </form>
+
+            <br>
+
+            <form method="POST"
+                  action="/admin/support/{{ ticket.id }}/close">
+
+                <button class="btn btn-red">
+                    Закрыть обращение
+                </button>
+
+            </form>
+
+        </div>
+
+        {% else %}
+
+        <div class="card">
+            ✅ Обращение закрыто
+        </div>
+
+        {% endif %}
+
+        </div>
+        """,
+        ticket=ticket,
+        messages=messages
+    )
+
+
+@app.route(
+    "/admin/support/<int:ticket_id>/reply",
+    methods=["POST"]
+)
+@admin_required
+def admin_reply_ticket(ticket_id):
+
+    text = request.form.get("text", "").strip()
+
+    if not text:
+        return redirect(
+            url_for(
+                "admin_ticket_page",
+                ticket_id=ticket_id
+            )
+        )
+
+    ticket = get_ticket(ticket_id)
+
+    if not ticket:
+        return "Not found", 404
+
+    add_support_message(
+        ticket_id,
+        "admin",
+        ADMIN_ID,
+        text
+    )
+
+    try:
+        asyncio.run(
+            send_telegram_message(
+                ticket["telegram_id"],
+                f"💬 Ответ поддержки по обращению "
+                f"#{ticket_id}:\n\n{text}"
+            )
+        )
+    except Exception as e:
+        print("Reply error:", e)
+
+    return redirect(
+        url_for(
+            "admin_ticket_page",
+            ticket_id=ticket_id
+        )
+    )
+
+
+@app.route(
+    "/admin/support/<int:ticket_id>/close",
+    methods=["POST"]
+)
+@admin_required
+def close_ticket(ticket_id):
+
+    conn = db()
+
+    ticket = conn.execute(
+        "SELECT * FROM support_tickets WHERE id=?",
+        (ticket_id,)
+    ).fetchone()
+
+    conn.execute("""
+        UPDATE support_tickets
+        SET status='closed', updated_at=?
+        WHERE id=?
+    """, (
+        now(),
+        ticket_id
+    ))
+
+    conn.commit()
+    conn.close()
+
+    if ticket:
+        try:
+            asyncio.run(
+                send_telegram_message(
+                    ticket["telegram_id"],
+                    f"✅ Обращение #{ticket_id} закрыто."
+                )
+            )
+        except Exception as e:
+            print(e)
+
+    return redirect(
+        url_for(
+            "admin_support_page"
+        )
+    )
+
+
+@app.route("/admin/notifications")
+@admin_required
+def notifications_page():
+
+    conn = db()
+
+    rows = conn.execute("""
+        SELECT * FROM notifications
+        ORDER BY id DESC
+        LIMIT 100
+    """).fetchall()
+
+    conn.execute("""
+        UPDATE notifications
+        SET is_read=1
+        WHERE is_read=0
+    """)
+
+    conn.commit()
+    conn.close()
+
+    return render_template_string(
+        BASE_STYLE + """
+        <div class="nav">
+            <div class="logo">🌙 Lunevia</div>
+            <a href="/admin">Главная</a>
+            <a href="/admin/orders">Заказы</a>
+            <a href="/admin/support">Поддержка</a>
+            <a href="/admin/notifications">Уведомления</a>
+            <a href="/admin/logout">Выйти</a>
+        </div>
+
+        <div class="container">
+
+        <h1>🔔 Уведомления</h1>
+
+        {% for n in rows %}
+
+        <div class="card">
+
+            <h3>{{ n.title }}</h3>
+
+            <p>{{ n.body }}</p>
+
+            <small>
+                {{ n.created_at }}
+            </small>
+
+        </div>
+
+        {% endfor %}
+
+        </div>
+        """,
+        rows=rows
+    )
 
 
 # =========================================================
-# CALLBACK
+# CALLBACK ROUTER
 # =========================================================
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def button_handler(update, context):
+
     query = update.callback_query
     data = query.data
 
-    if data == "admin_panel":
-        if not admin_only(query.from_user.id):
-            await query.answer("Нет доступа.", show_alert=True)
-            return
+    if data == "lang_ru":
         await query.answer()
+
+        save_user(query.from_user)
+
         await query.edit_message_text(
-            "👑 <b>Админ-панель Lunevia</b>\n\nВыбери раздел:",
-            parse_mode="HTML",
-            reply_markup=admin_menu_keyboard(),
-        )
-    elif data == "support":
-        await support_start(update, context)
-    elif data == "admin_orders_all":
-        await admin_orders_view(update, context, None)
-    elif data == "admin_orders_review":
-        await admin_orders_view(update, context, "payment_review")
-    elif data == "admin_orders_progress":
-        await admin_orders_view(update, context, "in_progress")
-    elif data == "admin_orders_ready":
-        await admin_orders_view(update, context, "ready")
-    elif data == "admin_stats":
-        await admin_stats_view(update, context)
-    elif data.startswith("admin_order_"):
-        await admin_order_view(update, context)
-    elif data.startswith("admin_status_"):
-        await admin_set_order_status(update, context)
-    elif data.startswith("admin_msg_"):
-        await admin_start_reply(update, context)
-    elif data.startswith("support_reply_"):
-        await admin_start_reply(update, context)
-    elif data.startswith("support_close_"):
-        await admin_close_support(update, context)
-    elif data == "language":
-        await query.answer()
-        await query.edit_message_text(
-            "🌐 <b>Выбери язык / Обери мову</b>",
-            parse_mode="HTML",
-            reply_markup=language_keyboard(),
+            "🇷🇺 Язык: Русский\n\n"
+            "🏠 Главное меню",
+            reply_markup=main_menu()
         )
 
-    elif data.startswith("lang_"):
-        await choose_language(update, context)
+    elif data == "lang_uk":
+        await query.answer()
+
+        save_user(query.from_user)
+
+        await query.edit_message_text(
+            "🇺🇦 Мова: Українська\n\n"
+            "🏠 Головне меню",
+            reply_markup=main_menu()
+        )
 
     elif data == "menu":
-        await menu(update, context)
+        await show_menu(update, context)
 
-    elif data == "create":
-        await start_order(update, context)
+    elif data == "create_site":
+        await create_site(update, context)
 
     elif data.startswith("type_"):
         await choose_type(update, context)
@@ -1789,153 +2317,151 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("tariff_"):
         await choose_tariff(update, context)
 
-    elif data in ["photos_yes", "photos_no"]:
-        await photos_choice(update, context)
+    elif data.startswith("photos_"):
+        await choose_photos(update, context)
 
     elif data.startswith("design_"):
-        await choose_design(update, context)
+        await select_design(update, context)
 
     elif data == "confirm_order":
         await confirm_order(update, context)
 
     elif data.startswith("paid_"):
-        await paid(update, context)
+        await paid_button(update, context)
 
     elif data.startswith("pay_ok_") or data.startswith("pay_no_"):
-        await admin_payment_action(update, context)
+        await payment_action(update, context)
 
-    elif data.startswith("order_"):
-        await show_order(update, context)
+    elif data.startswith("status_"):
+        await admin_status_button(update, context)
 
-    elif data == "examples":
-        await examples(update, context)
+    elif data == "my_orders":
+        await my_orders(update, context)
+
+    elif data.startswith("user_order_"):
+        await user_order(update, context)
+
+    elif data == "support":
+        await support(update, context)
 
     elif data == "prices":
         await prices(update, context)
 
-    elif data == "description":
-        await description(update, context)
+    elif data == "examples":
+        await examples(update, context)
 
-    elif data == "orders":
-        await orders(update, context)
+    elif data == "about":
+        await about(update, context)
 
-    elif data.startswith("back_"):
-        await back_handler(update, context)
+    elif data == "admin_orders":
+        await admin_orders_button(update, context)
+
+    elif data.startswith("admin_order_"):
+        await admin_order_button(update, context)
+
 
 # =========================================================
-# ADMIN PANEL COMMAND
+# FLASK SERVER
 # =========================================================
 
-async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not admin_only(update.effective_user.id):
-        await update.message.reply_text("❌ Нет доступа.")
-        return
-
-    await update.message.reply_text(
-        "👑 <b>Админ-панель Lunevia</b>\n\nВыбери раздел:",
-        parse_mode="HTML",
-        reply_markup=admin_menu_keyboard(),
+def run_web():
+    print(
+        f"🌐 Lunevia Admin запущен: порт {PORT}"
     )
 
-# =========================================================
-# CANCEL
-# =========================================================
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    current_lang = context.user_data.get("lang", "ru")
-    context.user_data.clear()
-    context.user_data["lang"] = current_lang
-
-    await update.message.reply_text(
-        tr(
-            context,
-            "❌ Создание заказа отменено.\n\nНажми /start, чтобы начать заново.",
-            "❌ Створення замовлення скасовано.\n\nНатисни /start, щоб почати заново.",
-        )
+    app.run(
+        host="0.0.0.0",
+        port=PORT,
+        debug=False,
+        use_reloader=False
     )
 
 
 # =========================================================
-# ОБРАБОТКА ТЕКСТА
+# MAIN
 # =========================================================
-
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    step = context.user_data.get("step")
-
-    if step == "admin_reply":
-        await admin_send_message(update, context)
-    elif step == "support":
-        await send_support_question(update, context)
-    elif step == "recipient_name":
-        await ask_date(update, context)
-
-    elif step == "date":
-        await ask_text(update, context)
-
-    elif step == "text":
-        await ask_photos(update, context)
-
-    else:
-        await update.message.reply_text(
-            tr(
-                context,
-                "Выбери действие через меню или нажми /start.",
-                "Обери дію через меню або натисни /start.",
-            )
-        )
-
-
-# =========================================================
-# ЗАПУСК
-# =========================================================
-
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(b"Lunevia Orders is running")
-
-    def log_message(self, format, *args):
-        return
-
-
-def run_health_server():
-    port = int(os.getenv("PORT", "10000"))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    print(f"🌐 Render health server запущен на порту {port}")
-    server.serve_forever()
-
 
 def main():
+
     init_db()
 
     if not BOT_TOKEN:
-        print("❌ Не найден BOT_TOKEN в .env")
+        print("❌ BOT_TOKEN не указан в .env")
         return
 
-    # Render Free Web Service requires an open HTTP port.
-    # The Telegram bot itself continues using polling in the main thread.
-    threading.Thread(target=run_health_server, daemon=True).start()
+    print("🤖 Lunevia Bot запускается...")
 
-    application = Application.builder().token(BOT_TOKEN).build()
+    threading.Thread(
+        target=run_web,
+        daemon=True
+    ).start()
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("cancel", cancel))
-    application.add_handler(CommandHandler("done", done))
-    application.add_handler(CommandHandler("admin", admin_panel))
-
-    application.add_handler(CallbackQueryHandler(button_handler))
-
-    application.add_handler(
-        MessageHandler(filters.PHOTO, handle_photo)
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .build()
     )
 
     application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
+        CommandHandler(
+            "start",
+            start
+        )
     )
 
-    print("💙 Lunevia Orders запущен!")
+    application.add_handler(
+        CommandHandler(
+            "cancel",
+            cancel
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "done",
+            done_photos
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "admin",
+            admin_command
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            button_handler
+        )
+    )
+
+    application.add_handler(
+        MessageHandler(
+            filters.PHOTO,
+            handle_receipt
+        ),
+        group=1
+    )
+
+    application.add_handler(
+        MessageHandler(
+            filters.PHOTO,
+            handle_photo
+        ),
+        group=2
+    )
+
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            handle_order_text
+        )
+    )
+
+    print("✅ Lunevia Bot запущен!")
+    print(f"🌐 Admin: http://0.0.0.0:{PORT}/admin")
+
     application.run_polling()
 
 
