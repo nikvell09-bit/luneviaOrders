@@ -2,6 +2,8 @@ import os
 import sqlite3
 from datetime import datetime
 from dotenv import load_dotenv
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -1873,6 +1875,24 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ЗАПУСК
 # =========================================================
 
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"Lunevia Orders is running")
+
+    def log_message(self, format, *args):
+        return
+
+
+def run_health_server():
+    port = int(os.getenv("PORT", "10000"))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    print(f"🌐 Render health server запущен на порту {port}")
+    server.serve_forever()
+
+
 def main():
     init_db()
 
@@ -1880,12 +1900,16 @@ def main():
         print("❌ Не найден BOT_TOKEN в .env")
         return
 
+    # Render Free Web Service requires an open HTTP port.
+    # The Telegram bot itself continues using polling in the main thread.
+    threading.Thread(target=run_health_server, daemon=True).start()
+
     application = Application.builder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("cancel", cancel))
     application.add_handler(CommandHandler("done", done))
-    application.add_handler(CommandHandler("admin", admin_command))
+    application.add_handler(CommandHandler("admin", admin_panel))
 
     application.add_handler(CallbackQueryHandler(button_handler))
 
