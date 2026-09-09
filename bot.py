@@ -1822,6 +1822,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("back_"):
         await back_handler(update, context)
 
+# =========================================================
+# ADMIN PANEL COMMAND
+# =========================================================
+
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not admin_only(update.effective_user.id):
+        await update.message.reply_text("❌ Нет доступа.")
+        return
+
+    await update.message.reply_text(
+        "👑 <b>Админ-панель Lunevia</b>\n\nВыбери раздел:",
+        parse_mode="HTML",
+        reply_markup=admin_menu_keyboard(),
+    )
 
 # =========================================================
 # CANCEL
