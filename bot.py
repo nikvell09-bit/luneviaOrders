@@ -259,6 +259,10 @@ def main_menu(context):
             callback_data="orders"
         )],
         [InlineKeyboardButton(
+            tr(context, "🆘 Поддержка", "🆘 Підтримка"),
+            callback_data="support"
+        )],
+        [InlineKeyboardButton(
             tr(context, "🌐 Сменить язык", "🌐 Змінити мову"),
             callback_data="language"
         )],
@@ -1439,6 +1443,288 @@ async def admin_payment_action(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 # =========================================================
+# ПОДДЕРЖКА И АДМИН-ПАНЕЛЬ
+# =========================================================
+
+async def support_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data["step"] = "support"
+    await query.edit_message_text(
+        tr(
+            context,
+            "🆘 <b>Поддержка Lunevia</b>\n\n"
+            "Напиши свой вопрос одним сообщением.\n"
+            "Мы передадим его администратору и ответим здесь. 💙",
+            "🆘 <b>Підтримка Lunevia</b>\n\n"
+            "Напиши своє питання одним повідомленням.\n"
+            "Ми передамо його адміністратору та відповімо тут. 💙",
+        ),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Назад", callback_data="menu")]
+        ]),
+    )
+
+
+async def send_support_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    question = update.message.text.strip()
+    if not question:
+        return
+
+    user = update.effective_user
+    username = f"@{user.username}" if user.username else "без username"
+
+    if ADMIN_ID:
+        admin_text = (
+            "🆘 <b>НОВЫЙ ВОПРОС В ПОДДЕРЖКУ</b>\n\n"
+            f"👤 Клиент: {username}\n"
+            f"🆔 Telegram ID: <code>{user.id}</code>\n\n"
+            f"💬 <b>Вопрос:</b>\n{question}"
+        )
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=admin_text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💬 Ответить", callback_data=f"support_reply_{user.id}")],
+                [InlineKeyboardButton("❌ Закрыть", callback_data=f"support_close_{user.id}")],
+            ]),
+        )
+
+    context.user_data["step"] = None
+    await update.message.reply_text(
+        tr(
+            context,
+            "✅ Вопрос отправлен в поддержку!\n\nМы ответим тебе здесь. 💙",
+            "✅ Питання надіслано в підтримку!\n\nМи відповімо тобі тут. 💙",
+        ),
+        reply_markup=main_menu(context),
+    )
+
+
+def admin_only(user_id):
+    return user_id == ADMIN_ID and ADMIN_ID != 0
+
+
+def admin_menu_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📦 Все заказы", callback_data="admin_orders_all")],
+        [InlineKeyboardButton("🟠 Проверка оплаты", callback_data="admin_orders_review")],
+        [InlineKeyboardButton("🔵 В работе", callback_data="admin_orders_progress")],
+        [InlineKeyboardButton("🟢 Готовые", callback_data="admin_orders_ready")],
+        [InlineKeyboardButton("📊 Статистика", callback_data="admin_stats")],
+    ])
+
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not admin_only(update.effective_user.id):
+        await update.message.reply_text("❌ Нет доступа.")
+        return
+    await update.message.reply_text(
+        "👑 <b>Админ-панель Lunevia</b>\n\nВыбери раздел:",
+        parse_mode="HTML",
+        reply_markup=admin_menu_keyboard(),
+    )
+
+
+def admin_orders(status=None):
+    conn = db_connect()
+    cur = conn.cursor()
+    if status:
+        cur.execute(
+            "SELECT id, telegram_id, username, tariff, price, recipient_name, status, created_at "
+            "FROM orders WHERE status = ? ORDER BY id DESC LIMIT 30",
+            (status,),
+        )
+    else:
+        cur.execute(
+            "SELECT id, telegram_id, username, tariff, price, recipient_name, status, created_at "
+            "FROM orders ORDER BY id DESC LIMIT 30"
+        )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+async def admin_orders_view(update: Update, context: ContextTypes.DEFAULT_TYPE, status=None):
+    query = update.callback_query
+    await query.answer()
+    if not admin_only(query.from_user.id):
+        await query.answer("Нет доступа.", show_alert=True)
+        return
+
+    rows = admin_orders(status)
+    title = {
+        None: "📦 <b>Все заказы</b>",
+        "payment_review": "🟠 <b>Проверка оплаты</b>",
+        "in_progress": "🔵 <b>Заказы в работе</b>",
+        "ready": "🟢 <b>Готовые заказы</b>",
+    }[status]
+
+    if not rows:
+        text = title + "\n\nНет заказов."
+        keyboard = [[InlineKeyboardButton("⬅️ Админ-панель", callback_data="admin_panel")]]
+    else:
+        lines = [title + "\n"]
+        keyboard = []
+        for order_id, tg_id, username, tariff, price, recipient, st, created in rows:
+            display_user = f"@{username}" if username else str(tg_id)
+            lines.append(
+                f"<b>#{order_id}</b> — {tariff} — {price} грн\n"
+                f"👤 {display_user} → {recipient}\n"
+                f"📌 {status_text(context, st)}"
+            )
+            keyboard.append([
+                InlineKeyboardButton(f"📄 Заказ #{order_id}", callback_data=f"admin_order_{order_id}")
+            ])
+        keyboard.append([InlineKeyboardButton("⬅️ Админ-панель", callback_data="admin_panel")])
+        text = "\n\n".join(lines)
+
+    await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def admin_order_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not admin_only(query.from_user.id):
+        await query.answer("Нет доступа.", show_alert=True)
+        return
+
+    order_id = int(query.data.rsplit("_", 1)[1])
+    row = get_order(order_id)
+    if not row:
+        await query.edit_message_text("❌ Заказ не найден.", reply_markup=admin_menu_keyboard())
+        return
+
+    username = f"@{row[2]}" if row[2] else "без username"
+    text = (
+        f"📄 <b>ЗАКАЗ #{row[0]}</b>\n\n"
+        f"👤 Клиент: {username}\n"
+        f"🆔 Telegram ID: <code>{row[1]}</code>\n"
+        f"🎯 Тип: <b>{row[4]}</b>\n"
+        f"💎 Тариф: <b>{row[5]}</b>\n"
+        f"💰 Цена: <b>{row[6]} грн</b>\n"
+        f"👤 Для кого: <b>{row[7]}</b>\n"
+        f"📅 Дата: <b>{row[8]}</b>\n"
+        f"📸 Фото: <b>{row[10]}</b>\n"
+        f"🎨 Дизайн: <b>{row[11]}</b>\n"
+        f"📌 Статус: <b>{status_text(context, row[12])}</b>\n\n"
+        f"💌 <b>Текст:</b>\n{row[9] or '—'}"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton("💬 Написать клиенту", callback_data=f"admin_msg_{row[1]}")],
+        [InlineKeyboardButton("🔵 В работу", callback_data=f"admin_status_in_progress_{order_id}"),
+         InlineKeyboardButton("🟢 Готово", callback_data=f"admin_status_ready_{order_id}")],
+        [InlineKeyboardButton("⚫ Отменить", callback_data=f"admin_status_cancelled_{order_id}")],
+        [InlineKeyboardButton("⬅️ Админ-панель", callback_data="admin_panel")],
+    ]
+    await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def admin_set_order_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not admin_only(query.from_user.id):
+        await query.answer("Нет доступа.", show_alert=True)
+        return
+    parts = query.data.split("_")
+    status = parts[2]
+    order_id = int(parts[3])
+    row = get_order(order_id)
+    if not row:
+        await query.answer("Заказ не найден.", show_alert=True)
+        return
+    set_status(order_id, status)
+    await query.answer("Статус обновлён")
+    await context.bot.send_message(
+        chat_id=row[1],
+        text=(
+            f"📌 <b>Статус заказа #{order_id} изменён</b>\n\n"
+            f"Новый статус: <b>{status_text(context, status)}</b>"
+        ),
+        parse_mode="HTML",
+    )
+    await admin_order_view(update, context)
+
+
+async def admin_stats_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not admin_only(query.from_user.id):
+        await query.answer("Нет доступа.", show_alert=True)
+        return
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM orders")
+    total = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM orders WHERE status = 'payment_review'")
+    review = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM orders WHERE status = 'in_progress'")
+    progress = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM orders WHERE status = 'ready'")
+    ready = cur.fetchone()[0]
+    cur.execute("SELECT COALESCE(SUM(price), 0) FROM orders WHERE status IN ('paid','in_progress','ready')")
+    revenue = cur.fetchone()[0]
+    conn.close()
+
+    text = (
+        "📊 <b>Статистика Lunevia</b>\n\n"
+        f"📦 Всего заказов: <b>{total}</b>\n"
+        f"🟠 На проверке: <b>{review}</b>\n"
+        f"🔵 В работе: <b>{progress}</b>\n"
+        f"🟢 Готово: <b>{ready}</b>\n"
+        f"💰 Оплачено/в работе: <b>{revenue} грн</b>"
+    )
+    await query.edit_message_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Админ-панель", callback_data="admin_panel")]
+        ]),
+    )
+
+
+async def admin_start_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not admin_only(query.from_user.id):
+        await query.answer("Нет доступа.", show_alert=True)
+        return
+    user_id = int(query.data.rsplit("_", 1)[1])
+    context.user_data["step"] = "admin_reply"
+    context.user_data["reply_to_user"] = user_id
+    await query.answer()
+    await query.message.reply_text(
+        f"💬 Напиши сообщение для пользователя <code>{user_id}</code> одним сообщением.",
+        parse_mode="HTML",
+    )
+
+
+async def admin_send_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = context.user_data.get("reply_to_user")
+    if not user_id or not admin_only(update.effective_user.id):
+        return
+    text = update.message.text.strip()
+    await context.bot.send_message(
+        chat_id=user_id,
+        text=f"💬 <b>Сообщение от Lunevia</b>\n\n{text}",
+        parse_mode="HTML",
+    )
+    context.user_data["step"] = None
+    context.user_data.pop("reply_to_user", None)
+    await update.message.reply_text("✅ Сообщение отправлено клиенту.")
+
+
+async def admin_close_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not admin_only(query.from_user.id):
+        await query.answer("Нет доступа.", show_alert=True)
+        return
+    await query.answer("Закрыто")
+    await query.edit_message_text("✅ Обращение закрыто.")
+
+
+# =========================================================
 # CALLBACK
 # =========================================================
 
@@ -1446,7 +1732,39 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
 
-    if data == "language":
+    if data == "admin_panel":
+        if not admin_only(query.from_user.id):
+            await query.answer("Нет доступа.", show_alert=True)
+            return
+        await query.answer()
+        await query.edit_message_text(
+            "👑 <b>Админ-панель Lunevia</b>\n\nВыбери раздел:",
+            parse_mode="HTML",
+            reply_markup=admin_menu_keyboard(),
+        )
+    elif data == "support":
+        await support_start(update, context)
+    elif data == "admin_orders_all":
+        await admin_orders_view(update, context, None)
+    elif data == "admin_orders_review":
+        await admin_orders_view(update, context, "payment_review")
+    elif data == "admin_orders_progress":
+        await admin_orders_view(update, context, "in_progress")
+    elif data == "admin_orders_ready":
+        await admin_orders_view(update, context, "ready")
+    elif data == "admin_stats":
+        await admin_stats_view(update, context)
+    elif data.startswith("admin_order_"):
+        await admin_order_view(update, context)
+    elif data.startswith("admin_status_"):
+        await admin_set_order_status(update, context)
+    elif data.startswith("admin_msg_"):
+        await admin_start_reply(update, context)
+    elif data.startswith("support_reply_"):
+        await admin_start_reply(update, context)
+    elif data.startswith("support_close_"):
+        await admin_close_support(update, context)
+    elif data == "language":
         await query.answer()
         await query.edit_message_text(
             "🌐 <b>Выбери язык / Обери мову</b>",
@@ -1528,7 +1846,11 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     step = context.user_data.get("step")
 
-    if step == "recipient_name":
+    if step == "admin_reply":
+        await admin_send_message(update, context)
+    elif step == "support":
+        await send_support_question(update, context)
+    elif step == "recipient_name":
         await ask_date(update, context)
 
     elif step == "date":
@@ -1563,6 +1885,7 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("cancel", cancel))
     application.add_handler(CommandHandler("done", done))
+    application.add_handler(CommandHandler("admin", admin_command))
 
     application.add_handler(CallbackQueryHandler(button_handler))
 
