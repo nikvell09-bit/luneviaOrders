@@ -1916,7 +1916,8 @@ def main():
 
     # Render Free Web Service requires an open HTTP port.
     # The Telegram bot itself continues using polling in the main thread.
-    threading.Thread(target=run_health_server, daemon=True).start()
+    from admin_web import run_admin_web
+    threading.Thread(target=run_admin_web, daemon=True).start()
 
     application = Application.builder().token(BOT_TOKEN).build()
 
