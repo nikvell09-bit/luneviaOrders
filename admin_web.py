@@ -1,237 +1,565 @@
+
 import os
 import sqlite3
-import json
 import urllib.parse
 import urllib.request
+import json
+import html
 from functools import wraps
-from flask import Flask, request, redirect, url_for, session, render_template_string, flash, send_file, abort
 from io import BytesIO
 
-DB_FILE = os.getenv('DB_FILE', 'lunevia_orders.db')
-BOT_TOKEN = os.getenv('BOT_TOKEN', '')
-ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD', '')
-SECRET_KEY = os.getenv('ADMIN_SECRET_KEY', '') or os.getenv('BOT_TOKEN', 'change-this-secret-key')
+from flask import (
+    Flask, request, redirect, url_for, session,
+    render_template_string, flash, send_file, abort
+)
 
 app = Flask(__name__)
-app.secret_key = SECRET_KEY
-app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax', SESSION_COOKIE_SECURE=os.getenv('COOKIE_SECURE', '0') == '1')
+app.secret_key = os.getenv("ADMIN_SECRET_KEY") or os.getenv("BOT_TOKEN") or "change-this-secret"
 
-STATUSES = {
-    'awaiting_payment': 'Ожидает оплату',
-    'payment_review': 'Проверка оплаты',
-    'paid': 'Оплачено',
-    'in_progress': 'В работе',
-    'ready': 'Готово',
-    'payment_rejected': 'Оплата отклонена',
-    'cancelled': 'Отменён',
-}
-
-BASE_STYLE = '''
-:root{color-scheme:dark;--bg:#090a12;--panel:#121421;--panel2:#191b2c;--line:#292c43;--text:#f4f5ff;--muted:#a2a7c2;--purple:#9b7bff;--blue:#62c8ff;--green:#58d6a3;--red:#ff7185}
-*{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at top right,#1b1640 0,transparent 40%),var(--bg);color:var(--text);font:15px/1.5 Inter,Segoe UI,Arial,sans-serif}a{color:inherit;text-decoration:none}.shell{max-width:1440px;margin:auto;padding:26px}.top{display:flex;align-items:center;justify-content:space-between;gap:18px;margin-bottom:26px}.brand{display:flex;gap:12px;align-items:center}.logo{width:44px;height:44px;border-radius:15px;background:linear-gradient(135deg,#a27bff,#48c7ff);display:grid;place-items:center;font-size:22px;color:#080914;font-weight:900}.brand h1{font-size:22px;margin:0}.muted{color:var(--muted)}.nav{display:flex;gap:10px;flex-wrap:wrap}.btn,button{border:1px solid var(--line);background:var(--panel2);color:var(--text);border-radius:11px;padding:10px 14px;font:inherit;cursor:pointer}.btn.primary,button.primary{background:linear-gradient(135deg,#8c68f6,#5b9fff);border:0;color:white;font-weight:700}.btn:hover,button:hover{filter:brightness(1.13)}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:linear-gradient(145deg,rgba(25,27,44,.97),rgba(15,17,29,.97));border:1px solid var(--line);border-radius:18px;padding:20px;min-width:0;box-shadow:0 14px 38px #0002}.metric{font-size:30px;font-weight:800;margin-top:8px}.label{color:var(--muted);font-size:13px}.section{margin-top:20px}.section-head{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:14px}.section-head h2{font-size:18px;margin:0}.filters{display:flex;gap:9px;flex-wrap:wrap;margin-bottom:14px}input,select,textarea{background:#0d0f1b;color:var(--text);border:1px solid var(--line);border-radius:10px;padding:11px 12px;font:inherit;max-width:100%}input,select{min-height:42px}textarea{width:100%;min-height:115px;resize:vertical}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:13px 12px;border-bottom:1px solid var(--line);vertical-align:middle}th{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}tr:last-child td{border-bottom:0}.table-wrap{overflow:auto}.pill{display:inline-block;padding:5px 9px;border-radius:99px;background:#292541;color:#d2c6ff;font-size:12px;white-space:nowrap}.pill.green{background:#15372f;color:#80efc1}.pill.orange{background:#42301c;color:#ffd18a}.pill.red{background:#401f2a;color:#ff9eae}.two{display:grid;grid-template-columns:minmax(0,1.2fr) minmax(300px,.8fr);gap:16px}.detail-list{display:grid;grid-template-columns:140px 1fr;gap:10px;margin:0}.detail-list dt{color:var(--muted)}.detail-list dd{margin:0;overflow-wrap:anywhere}.actions{display:flex;gap:8px;flex-wrap:wrap}.form-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.flash{padding:12px 15px;border:1px solid #53447f;background:#211a39;border-radius:12px;margin-bottom:14px}.login{max-width:440px;margin:10vh auto;padding:0 20px}.login .card{padding:28px}.login input{width:100%;margin:10px 0 14px}.empty{text-align:center;padding:40px;color:var(--muted)}.receipt{max-width:100%;border-radius:12px;border:1px solid var(--line)}.full{width:100%}.small{font-size:12px}.danger{color:#ff9eae}.success{color:#80efc1}
-@media(max-width:900px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.two{grid-template-columns:1fr}.shell{padding:16px}.top{align-items:flex-start;flex-direction:column}.detail-list{grid-template-columns:115px 1fr}}@media(max-width:520px){.grid{grid-template-columns:1fr 1fr;gap:9px}.card{padding:14px}.metric{font-size:24px}th,td{padding:10px 8px}.brand h1{font-size:19px}}
-'''
-
-LOGIN = '''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Lunevia · Вход</title><style>''' + BASE_STYLE + '''</style></head><body><div class="login"><div class="brand" style="margin-bottom:20px"><div class="logo">L</div><div><h1>Lunevia Admin</h1><div class="muted">Панель управления заказами</div></div></div><div class="card"><h2 style="margin-top:0">Вход администратора</h2><p class="muted">Введите пароль, заданный в настройках Render.</p>{% with messages = get_flashed_messages() %}{% for m in messages %}<div class="flash">{{m}}</div>{% endfor %}{% endwith %}<form method="post"><label class="label" for="password">Пароль</label><input id="password" name="password" type="password" autocomplete="current-password" required autofocus><button class="primary full" type="submit">Войти в панель →</button></form></div><p class="muted small" style="text-align:center;margin-top:16px">Доступ только для администратора</p></div></body></html>'''
-
-LAYOUT = '''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{{ title }} · Lunevia</title><style>''' + BASE_STYLE + '''</style></head><body><div class="shell"><header class="top"><a class="brand" href="{{ url_for('dashboard') }}"><div class="logo">L</div><div><h1>Lunevia <span style="color:var(--purple)">Admin</span></h1><div class="muted small">Заказы · Клиенты · Оплаты</div></div></a><nav class="nav"><a class="btn" href="{{ url_for('dashboard') }}">Обзор</a><a class="btn" href="{{ url_for('orders') }}">Заказы</a><a class="btn" href="{{ url_for('orders', status='payment_review') }}">Проверка оплат</a><a class="btn" href="{{ url_for('logout') }}">Выйти ↗</a></nav></header>{% with messages = get_flashed_messages() %}{% for m in messages %}<div class="flash">{{m}}</div>{% endfor %}{% endwith %}{{ body|safe }}</div></body></html>'''
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+DB_FILE = os.getenv("DB_FILE", "lunevia_orders.db")
 
 
 def db():
-    conn = sqlite3.connect(DB_FILE, timeout=15)
+    conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
-    conn.execute('PRAGMA busy_timeout=15000')
     return conn
 
 
-def login_required(fn):
-    @wraps(fn)
-    def wrapper(*args, **kwargs):
-        if not session.get('admin_logged_in'):
-            return redirect(url_for('login', next=request.path))
-        return fn(*args, **kwargs)
-    return wrapper
+def init_chat_db():
+    conn = db()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS chat_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id INTEGER NOT NULL,
+            direction TEXT NOT NULL,
+            message_text TEXT NOT NULL,
+            username TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    conn.close()
 
 
-def telegram_api(method, data=None, raw=False):
+def e(value):
+    return html.escape(str(value or ""))
+
+
+def telegram_api(method, data=None):
     if not BOT_TOKEN:
-        raise RuntimeError('На сервере не задан BOT_TOKEN')
-    url = f'https://api.telegram.org/bot{BOT_TOKEN}/{method}'
-    payload = urllib.parse.urlencode(data or {}).encode()
-    req = urllib.request.Request(url, data=payload, method='POST')
-    with urllib.request.urlopen(req, timeout=25) as response:
-        result = response.read()
-    if raw:
-        return result
-    parsed = json.loads(result.decode('utf-8'))
-    if not parsed.get('ok'):
-        raise RuntimeError(parsed.get('description', 'Telegram API error'))
-    return parsed.get('result')
+        raise RuntimeError("BOT_TOKEN не задан в переменных окружения Render")
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+    payload = urllib.parse.urlencode(data or {}).encode("utf-8")
+
+    req = urllib.request.Request(url, data=payload)
+
+    with urllib.request.urlopen(req, timeout=20) as response:
+        result = json.loads(response.read().decode("utf-8"))
+
+    if not result.get("ok"):
+        raise RuntimeError(result.get("description", "Ошибка Telegram API"))
+
+    return result.get("result")
 
 
 def send_telegram_message(chat_id, text):
-    return telegram_api('sendMessage', {'chat_id': chat_id, 'text': text, 'parse_mode': 'HTML'})
+    return telegram_api("sendMessage", {
+        "chat_id": chat_id,
+        "text": text
+    })
 
 
-def status_pill(status):
-    cls = 'green' if status in ('paid','ready') else 'orange' if status in ('payment_review','awaiting_payment','in_progress') else 'red' if status in ('payment_rejected','cancelled') else ''
-    return f'<span class="pill {cls}">{STATUSES.get(status, status or "—")}</span>'
+def save_message(telegram_id, direction, message_text, username=None):
+    conn = db()
+    conn.execute("""
+        INSERT INTO chat_messages
+        (telegram_id, direction, message_text, username)
+        VALUES (?, ?, ?, ?)
+    """, (telegram_id, direction, message_text, username))
+    conn.commit()
+    conn.close()
 
 
-def layout(title, body):
-    return render_template_string(LAYOUT, title=title, body=body)
+def login_required(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        if not session.get("admin_logged_in"):
+            return redirect(url_for("login"))
+        return func(*args, **kwargs)
+    return wrapper
 
 
-@app.route('/health')
-def health():
-    return 'Lunevia Admin is running', 200
+BASE_STYLE = """
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#101010;color:#eee;font-family:Arial,sans-serif}
+header{background:#191919;padding:18px 24px;border-bottom:1px solid #333}
+header h2{margin:0;color:#e8bd69}
+nav{display:flex;gap:16px;flex-wrap:wrap;margin-top:14px}
+a{color:#e8bd69;text-decoration:none}
+a:hover{text-decoration:underline}
+main{max-width:1200px;margin:24px auto;padding:0 16px}
+.card{background:#191919;border:1px solid #333;border-radius:12px;padding:18px;margin-bottom:16px}
+input,textarea,select{width:100%;padding:11px;background:#101010;border:1px solid #444;color:#fff;border-radius:7px;margin:6px 0 12px}
+textarea{min-height:110px;resize:vertical}
+button,.btn{display:inline-block;border:0;border-radius:7px;background:#d9ad5b;color:#111;padding:10px 15px;font-weight:bold;cursor:pointer}
+.btn-secondary{background:#333;color:#fff}
+.btn-danger{background:#7e3030;color:#fff}
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:11px;border-bottom:1px solid #333;vertical-align:top}
+small,.muted{color:#aaa}
+.message{padding:12px;border-radius:9px;margin:10px 0;white-space:pre-wrap;overflow-wrap:anywhere}
+.incoming{background:#252525;margin-right:12%}
+.outgoing{background:#493b25;margin-left:12%}
+.layout{display:grid;grid-template-columns:minmax(220px,320px) 1fr;gap:16px}
+.chat-list a{display:block;padding:12px;border-bottom:1px solid #333}
+.flash{padding:12px;background:#332b1c;border-radius:8px;margin-bottom:12px}
+@media(max-width:700px){.layout{grid-template-columns:1fr}table{font-size:13px}th,td{padding:7px}}
+</style>
+"""
 
-@app.route('/login', methods=['GET','POST'])
+
+def page(title, content):
+    return render_template_string("""
+    <!doctype html>
+    <html lang="ru">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      <title>{{ title }} — Lunevia</title>
+      """ + BASE_STYLE + """
+    </head>
+    <body>
+      <header>
+        <h2>♡ Lunevia Admin</h2>
+        {% if logged_in %}
+        <nav>
+          <a href="{{ url_for('dashboard') }}">Главная</a>
+          <a href="{{ url_for('orders') }}">Заказы</a>
+          <a href="{{ url_for('chats') }}">Чаты поддержки</a>
+          <a href="{{ url_for('logout') }}">Выйти</a>
+        </nav>
+        {% endif %}
+      </header>
+      <main>
+        {% with messages = get_flashed_messages() %}
+          {% for message in messages %}
+            <div class="flash">{{ message }}</div>
+          {% endfor %}
+        {% endwith %}
+        """ + content + """
+      </main>
+    </body>
+    </html>
+    """, title=title, logged_in=session.get("admin_logged_in", False))
+
+
+@app.route("/", methods=["GET"])
+def index():
+    if session.get("admin_logged_in"):
+        return redirect(url_for("dashboard"))
+    return redirect(url_for("login"))
+
+
+@app.route("/login", methods=["GET", "POST"])
 def login():
     if not ADMIN_PASSWORD:
-        return 'Ошибка настройки: добавь ADMIN_PASSWORD в переменные окружения Render.', 500
-    if request.method == 'POST':
-        if request.form.get('password', '') == ADMIN_PASSWORD:
-            session.clear()
-            session['admin_logged_in'] = True
-            return redirect(request.args.get('next') or url_for('dashboard'))
-        flash('Неверный пароль.')
-    return render_template_string(LOGIN)
+        return "Ошибка настройки: задай ADMIN_PASSWORD в Render Environment.", 500
 
-@app.route('/logout')
+    if request.method == "POST":
+        password = request.form.get("password", "")
+        if password == ADMIN_PASSWORD:
+            session.clear()
+            session["admin_logged_in"] = True
+            return redirect(url_for("dashboard"))
+        flash("Неверный пароль")
+
+    return page("Вход", """
+      <div class="card" style="max-width:420px;margin:40px auto">
+        <h2>Вход в админку</h2>
+        <form method="post">
+          <label>Пароль администратора</label>
+          <input type="password" name="password" required autofocus>
+          <button type="submit">Войти</button>
+        </form>
+      </div>
+    """)
+
+
+@app.route("/logout")
 def logout():
     session.clear()
-    return redirect(url_for('login'))
+    return redirect(url_for("login"))
 
-@app.route('/')
+
+@app.route("/dashboard")
 @login_required
 def dashboard():
     conn = db()
-    total = conn.execute('SELECT COUNT(*) FROM orders').fetchone()[0]
-    review = conn.execute("SELECT COUNT(*) FROM orders WHERE status='payment_review'").fetchone()[0]
-    progress = conn.execute("SELECT COUNT(*) FROM orders WHERE status='in_progress'").fetchone()[0]
-    ready = conn.execute("SELECT COUNT(*) FROM orders WHERE status='ready'").fetchone()[0]
-    revenue = conn.execute("SELECT COALESCE(SUM(price),0) FROM orders WHERE status IN ('paid','in_progress','ready')").fetchone()[0]
-    recent = conn.execute('SELECT id,telegram_id,username,tariff,price,recipient_name,status,created_at FROM orders ORDER BY id DESC LIMIT 8').fetchall()
+
+    try:
+        orders_count = conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
+        chats_count = conn.execute(
+            "SELECT COUNT(DISTINCT telegram_id) FROM chat_messages"
+        ).fetchone()[0]
+        messages_count = conn.execute(
+            "SELECT COUNT(*) FROM chat_messages"
+        ).fetchone()[0]
+        recent_orders = conn.execute(
+            "SELECT * FROM orders ORDER BY id DESC LIMIT 8"
+        ).fetchall()
+    except sqlite3.Error as exc:
+        conn.close()
+        return page("Ошибка базы", f"""
+          <div class="card">
+            <h3>Не удалось прочитать базу данных</h3>
+            <p>{e(exc)}</p>
+            <p>Проверь DB_FILE и существующую базу заказов.</p>
+          </div>
+        """), 500
+
     conn.close()
-    body = f'''<div class="section-head"><div><h2>Обзор</h2><div class="muted">Сводка по заказам Lunevia</div></div><a class="btn primary" href="{url_for('orders')}">Все заказы →</a></div>
-    <div class="grid"><div class="card"><div class="label">Всего заказов</div><div class="metric">{total}</div><div class="muted small">За всё время</div></div><div class="card"><div class="label">Ожидают проверки</div><div class="metric" style="color:var(--blue)">{review}</div><div class="muted small">Проверь квитанции</div></div><div class="card"><div class="label">В работе</div><div class="metric">{progress}</div><div class="muted small">Создание сайтов</div></div><div class="card"><div class="label">Подтверждённая выручка</div><div class="metric" style="color:var(--green)">{revenue} ₴</div><div class="muted small">Оплачено, в работе и готово</div></div></div>
-    <div class="section card"><div class="section-head"><h2>Последние заказы</h2><a class="btn" href="{url_for('orders')}">Открыть список</a></div>{orders_table(recent)}</div>
-    <div class="section"><div class="grid"><a class="card" href="{url_for('orders',status='payment_review')}"><div class="label">Быстрое действие</div><h3>🟠 Проверить оплаты</h3><div class="muted">Открыть заказы с квитанциями</div></a><a class="card" href="{url_for('orders',status='in_progress')}"><div class="label">Быстрое действие</div><h3>🔵 Заказы в работе</h3><div class="muted">Управлять текущими проектами</div></a></div></div>'''
-    return layout('Обзор', body)
+
+    rows = ""
+    for order in recent_orders:
+        rows += f"""
+        <tr>
+          <td>#{e(order['id'])}</td>
+          <td>{e(order['username'])}</td>
+          <td>{e(order['tariff'])}</td>
+          <td>{e(order['status'])}</td>
+          <td><a href="/order/{e(order['id'])}">Открыть</a></td>
+        </tr>
+        """
+
+    return page("Главная", f"""
+      <div class="layout">
+        <div class="card"><h3>Заказов</h3><h1>{orders_count}</h1></div>
+        <div class="card"><h3>Клиентов в чатах</h3><h1>{chats_count}</h1></div>
+      </div>
+      <div class="card">
+        <h3>Сообщений в истории</h3><h1>{messages_count}</h1>
+      </div>
+      <div class="card">
+        <h2>Последние заказы</h2>
+        <table>
+          <tr><th>ID</th><th>Клиент</th><th>Тариф</th><th>Статус</th><th></th></tr>
+          {rows}
+        </table>
+        <p><a href="/orders">Все заказы →</a></p>
+      </div>
+    """)
 
 
-def orders_table(rows):
-    if not rows:
-        return '<div class="empty">Заказов пока нет.</div>'
-    out = ['<div class="table-wrap"><table><thead><tr><th>Заказ</th><th>Клиент</th><th>Тариф</th><th>Сумма</th><th>Статус</th><th></th></tr></thead><tbody>']
-    for r in rows:
-        user = ('@' + r['username']) if r['username'] else str(r['telegram_id'])
-        out.append(f'<tr><td><b>#{r["id"]}</b><div class="muted small">{html_escape(r["created_at"] or "")}</div></td><td>{html_escape(user)}<div class="muted small">Для: {html_escape(r["recipient_name"] or "—")}</div></td><td>{html_escape(r["tariff"] or "—")}</td><td><b>{r["price"] or 0} ₴</b></td><td>{status_pill(r["status"])}</td><td><a class="btn" href="{url_for("order_detail", order_id=r["id"])}">Открыть →</a></td></tr>')
-    out.append('</tbody></table></div>')
-    return ''.join(out)
-
-
-def html_escape(value):
-    value = str(value if value is not None else '')
-    return value.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;').replace('"','&quot;').replace("'",'&#x27;')
-
-@app.route('/orders')
+@app.route("/orders")
 @login_required
 def orders():
-    status = request.args.get('status','')
-    search = request.args.get('q','').strip()
+    query = request.args.get("q", "").strip()
     conn = db()
-    query = 'SELECT id,telegram_id,username,tariff,price,recipient_name,status,created_at FROM orders WHERE 1=1'
-    args = []
-    if status in STATUSES:
-        query += ' AND status=?'; args.append(status)
-    if search:
-        if search.startswith('#') and search[1:].isdigit():
-            query += ' AND id=?'; args.append(int(search[1:]))
-        elif search.isdigit():
-            query += ' AND (id=? OR telegram_id=?)'; args.extend([int(search),int(search)])
-        else:
-            query += ' AND (username LIKE ? OR recipient_name LIKE ? OR custom_text LIKE ?)'; args.extend([f'%{search}%',f'%{search}%',f'%{search}%'])
-    query += ' ORDER BY id DESC LIMIT 250'
-    rows = conn.execute(query,args).fetchall(); conn.close()
-    options = ''.join(f'<option value="{k}" {"selected" if status==k else ""}>{v}</option>' for k,v in STATUSES.items())
-    body = f'''<div class="section-head"><div><h2>Заказы</h2><div class="muted">Найдено: {len(rows)} · максимум 250 в списке</div></div></div><div class="card"><form class="filters" method="get"><input name="q" value="{html_escape(search)}" placeholder="ID, username, имя или текст заказа" style="flex:1;min-width:210px"><select name="status"><option value="">Все статусы</option>{options}</select><button class="primary" type="submit">Найти</button><a class="btn" href="{url_for('orders')}">Сбросить</a></form>{orders_table(rows)}</div>'''
-    return layout('Заказы', body)
 
-@app.route('/orders/<int:order_id>', methods=['GET','POST'])
+    try:
+        if query:
+            like = f"%{query}%"
+            data = conn.execute("""
+                SELECT * FROM orders
+                WHERE CAST(id AS TEXT) LIKE ?
+                   OR CAST(telegram_id AS TEXT) LIKE ?
+                   OR username LIKE ?
+                   OR recipient_name LIKE ?
+                ORDER BY id DESC
+            """, (like, like, like, like)).fetchall()
+        else:
+            data = conn.execute(
+                "SELECT * FROM orders ORDER BY id DESC LIMIT 300"
+            ).fetchall()
+    except sqlite3.Error as exc:
+        conn.close()
+        return page("Заказы", f"<div class='card'>Ошибка: {e(exc)}</div>"), 500
+
+    conn.close()
+
+    rows = ""
+    for order in data:
+        rows += f"""
+        <tr>
+          <td>#{e(order['id'])}</td>
+          <td>{e(order['username'])}</td>
+          <td>{e(order['site_type'])}</td>
+          <td>{e(order['tariff'])}</td>
+          <td>{e(order['price'])} грн</td>
+          <td>{e(order['status'])}</td>
+          <td><a href="/order/{e(order['id'])}">Открыть</a></td>
+        </tr>
+        """
+
+    return page("Заказы", f"""
+      <div class="card">
+        <h2>Заказы</h2>
+        <form method="get">
+          <input name="q" value="{e(query)}" placeholder="ID, Telegram ID, username или имя">
+          <button>Найти</button>
+        </form>
+        <div style="overflow-x:auto">
+        <table>
+          <tr><th>ID</th><th>Клиент</th><th>Тип сайта</th><th>Тариф</th><th>Цена</th><th>Статус</th><th></th></tr>
+          {rows}
+        </table>
+        </div>
+      </div>
+    """)
+
+
+@app.route("/order/<int:order_id>", methods=["GET", "POST"])
 @login_required
 def order_detail(order_id):
     conn = db()
-    row = conn.execute('SELECT * FROM orders WHERE id=?',(order_id,)).fetchone()
-    conn.close()
-    if not row:
-        flash('Заказ не найден.'); return redirect(url_for('orders'))
-    if request.method == 'POST':
-        action = request.form.get('action','')
-        try:
-            if action == 'status':
-                new_status = request.form.get('status','')
-                if new_status not in STATUSES: raise ValueError('Неизвестный статус')
-                conn = db(); conn.execute('UPDATE orders SET status=? WHERE id=?',(new_status,order_id)); conn.commit(); conn.close()
-                try:
-                    send_telegram_message(row['telegram_id'], f'📌 <b>Статус заказа #{order_id} изменён</b>\n\nНовый статус: <b>{STATUSES[new_status]}</b>')
-                    flash('Статус изменён, клиент уведомлён в Telegram.')
-                except Exception as e:
-                    flash(f'Статус изменён, но уведомление не отправлено: {e}')
-            elif action == 'message':
-                message = request.form.get('message','').strip()
-                if not message: raise ValueError('Напиши текст сообщения')
-                send_telegram_message(row['telegram_id'], f'💬 <b>Сообщение от Lunevia</b>\n\n{html_escape(message)}')
-                flash('Сообщение отправлено клиенту в Telegram.')
-            elif action == 'approve':
-                conn = db(); conn.execute("UPDATE orders SET status='in_progress' WHERE id=?",(order_id,)); conn.commit(); conn.close()
-                send_telegram_message(row['telegram_id'], f'🎉 <b>Оплата заказа #{order_id} подтверждена!</b>\n\nВаш сайт уже в процессе создания. 💙')
-                flash('Оплата подтверждена, клиент уведомлён.')
-            elif action == 'reject':
-                conn = db(); conn.execute("UPDATE orders SET status='payment_rejected' WHERE id=?",(order_id,)); conn.commit(); conn.close()
-                send_telegram_message(row['telegram_id'], f'❌ <b>Оплата заказа #{order_id} не подтверждена.</b>\n\nПроверьте квитанцию или свяжитесь с поддержкой.')
-                flash('Оплата отклонена, клиент уведомлён.')
-        except Exception as e:
-            flash(f'Не удалось выполнить действие: {e}')
-        return redirect(url_for('order_detail', order_id=order_id))
-    conn = db(); row = conn.execute('SELECT * FROM orders WHERE id=?',(order_id,)).fetchone(); conn.close()
-    username = '@'+row['username'] if row['username'] else 'без username'
-    fields = [('Клиент',html_escape(username)),('Telegram ID',f'<code>{row["telegram_id"]}</code>'),('Тип сайта',html_escape(row['site_type'] or '—')),('Тариф',html_escape(row['tariff'] or '—')),('Цена',f'<b>{row["price"] or 0} грн</b>'),('Для кого',html_escape(row['recipient_name'] or '—')),('Дата события',html_escape(row['event_date'] or '—')),('Фотографий',str(row['photo_count'] or 0)),('Дизайн',html_escape(row['design'] or '—')),('Создан',html_escape(row['created_at'] or '—'))]
-    detail = ''.join(f'<dt>{k}</dt><dd>{v}</dd>' for k,v in fields)
-    options = ''.join(f'<option value="{k}" {"selected" if row["status"]==k else ""}>{v}</option>' for k,v in STATUSES.items())
-    receipt = f'<p><a class="btn" href="{url_for("receipt",order_id=order_id)}" target="_blank">Открыть квитанцию ↗</a></p>' if row['receipt_file_id'] else '<p class="muted">Квитанция не прикреплена к заказу.</p>'
-    custom_text = html_escape(row['custom_text'] or '—').replace('\n','<br>')
-    body = f'''<div class="section-head"><div><h2>Заказ #{order_id}</h2><div class="muted">Карточка клиента и управление заказом</div></div><a class="btn" href="{url_for('orders')}">← К списку</a></div><div class="two"><div class="card"><div class="section-head"><h2>Информация</h2>{status_pill(row['status'])}</div><dl class="detail-list">{detail}</dl><hr style="border:0;border-top:1px solid var(--line);margin:20px 0"><h3>Текст для сайта</h3><div style="overflow-wrap:anywhere">{custom_text}</div><div class="section"><h3>Квитанция оплаты</h3>{receipt}</div></div><div><div class="card"><h2 style="margin-top:0">Статус заказа</h2><form method="post"><input type="hidden" name="action" value="status"><select class="full" name="status">{options}</select><button class="primary full" style="margin-top:10px" type="submit">Сохранить статус</button></form><div class="actions section"><form method="post"><input type="hidden" name="action" value="approve"><button type="submit">✓ Подтвердить оплату</button></form><form method="post"><input type="hidden" name="action" value="reject"><button type="submit">✕ Отклонить оплату</button></form></div></div><div class="card section"><h2 style="margin-top:0">Написать клиенту</h2><p class="muted small">Сообщение отправится через Telegram-бота в чат клиента.</p><form method="post"><input type="hidden" name="action" value="message"><textarea name="message" required placeholder="Напиши клиенту..."></textarea><button class="primary full" style="margin-top:10px" type="submit">Отправить сообщение ↗</button></form></div></div></div>'''
-    return layout(f'Заказ #{order_id}', body)
+    order = conn.execute(
+        "SELECT * FROM orders WHERE id = ?", (order_id,)
+    ).fetchone()
 
-@app.route('/orders/<int:order_id>/receipt')
+    if not order:
+        conn.close()
+        abort(404)
+
+    if request.method == "POST":
+        action = request.form.get("action", "")
+
+        if action == "status":
+            status = request.form.get("status", "").strip()
+            try:
+                conn.execute(
+                    "UPDATE orders SET status = ? WHERE id = ?",
+                    (status, order_id)
+                )
+                conn.commit()
+                flash("Статус обновлён")
+            except sqlite3.Error as exc:
+                flash(f"Ошибка обновления статуса: {exc}")
+            conn.close()
+            return redirect(url_for("order_detail", order_id=order_id))
+
+        if action == "message":
+            text = request.form.get("message", "").strip()
+            telegram_id = order["telegram_id"]
+            conn.close()
+
+            if text:
+                try:
+                    send_telegram_message(telegram_id, text)
+                    save_message(telegram_id, "outgoing", text, "admin")
+                    flash("Сообщение отправлено клиенту")
+                except Exception as exc:
+                    flash(f"Не удалось отправить: {exc}")
+
+            return redirect(url_for("order_detail", order_id=order_id))
+
+    columns = [row["name"] for row in conn.execute(
+        "PRAGMA table_info(orders)"
+    ).fetchall()]
+    conn.close()
+
+    fields = ""
+    for col in columns:
+        if col in order.keys():
+            fields += f"<tr><th>{e(col)}</th><td>{e(order[col])}</td></tr>"
+
+    return page(f"Заказ #{order_id}", f"""
+      <div class="card">
+        <h2>Заказ #{order_id}</h2>
+        <div style="overflow-x:auto"><table>{fields}</table></div>
+      </div>
+      <div class="card">
+        <h3>Изменить статус</h3>
+        <form method="post">
+          <input type="hidden" name="action" value="status">
+          <select name="status">
+            {''.join(
+                f'<option value="{e(s)}" {"selected" if s == order["status"] else ""}>{e(s)}</option>'
+                for s in [
+                    "awaiting_payment", "payment_review", "paid",
+                    "in_progress", "ready", "payment_rejected", "cancelled"
+                ]
+            )}
+          </select>
+          <button>Сохранить статус</button>
+        </form>
+      </div>
+      <div class="card">
+        <h3>Написать клиенту</h3>
+        <form method="post">
+          <input type="hidden" name="action" value="message">
+          <textarea name="message" required placeholder="Текст сообщения"></textarea>
+          <button>Отправить в Telegram</button>
+        </form>
+        <p><a href="/chats/{e(order['telegram_id'])}">Открыть чат клиента →</a></p>
+      </div>
+    """)
+
+
+@app.route("/chats")
+@login_required
+def chats():
+    query = request.args.get("q", "").strip()
+    conn = db()
+
+    try:
+        if query:
+            like = f"%{query}%"
+            rows = conn.execute("""
+                SELECT telegram_id,
+                       MAX(username) AS username,
+                       COUNT(*) AS message_count,
+                       MAX(created_at) AS last_message
+                FROM chat_messages
+                WHERE CAST(telegram_id AS TEXT) LIKE ?
+                   OR username LIKE ?
+                GROUP BY telegram_id
+                ORDER BY MAX(id) DESC
+            """, (like, like)).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT telegram_id,
+                       MAX(username) AS username,
+                       COUNT(*) AS message_count,
+                       MAX(created_at) AS last_message
+                FROM chat_messages
+                GROUP BY telegram_id
+                ORDER BY MAX(id) DESC
+            """).fetchall()
+    except sqlite3.Error as exc:
+        conn.close()
+        return page("Чаты", f"<div class='card'>Ошибка базы: {e(exc)}</div>"), 500
+
+    conn.close()
+
+    items = ""
+    for row in rows:
+        username = row["username"] or "без username"
+        items += f"""
+        <a href="/chats/{e(row['telegram_id'])}">
+          <b>@{e(username)}</b><br>
+          <small>ID: {e(row['telegram_id'])}</small><br>
+          <small>Сообщений: {e(row['message_count'])}</small><br>
+          <small>{e(row['last_message'])}</small>
+        </a>
+        """
+
+    if not items:
+        items = "<p class='muted'>Пока сообщений нет. Они появятся, когда бот начнёт сохранять переписку.</p>"
+
+    return page("Чаты", f"""
+      <div class="card">
+        <h2>Чаты поддержки</h2>
+        <form method="get">
+          <input name="q" value="{e(query)}" placeholder="Telegram ID или username">
+          <button>Найти</button>
+        </form>
+        <div class="chat-list">{items}</div>
+      </div>
+    """)
+
+
+@app.route("/chats/<int:telegram_id>", methods=["GET", "POST"])
+@login_required
+def chat_detail(telegram_id):
+    if request.method == "POST":
+        text = request.form.get("message", "").strip()
+
+        if text:
+            try:
+                send_telegram_message(telegram_id, text)
+                save_message(telegram_id, "outgoing", text, "admin")
+                flash("Сообщение отправлено")
+            except Exception as exc:
+                flash(f"Ошибка отправки: {exc}")
+
+        return redirect(url_for("chat_detail", telegram_id=telegram_id))
+
+    conn = db()
+    messages = conn.execute("""
+        SELECT * FROM chat_messages
+        WHERE telegram_id = ?
+        ORDER BY id ASC
+        LIMIT 1000
+    """, (telegram_id,)).fetchall()
+    conn.close()
+
+    history = ""
+    for msg in messages:
+        direction = msg["direction"]
+        css_class = "incoming" if direction == "incoming" else "outgoing"
+        label = "Клиент" if direction == "incoming" else "Администратор"
+        history += f"""
+        <div class="message {css_class}">
+          <small>{label} · {e(msg['created_at'])}</small>
+          <div>{e(msg['message_text'])}</div>
+        </div>
+        """
+
+    if not history:
+        history = "<p class='muted'>История пока пустая.</p>"
+
+    return page("Чат", f"""
+      <div class="card">
+        <h2>Чат с клиентом</h2>
+        <p class="muted">Telegram ID: {telegram_id}</p>
+        <a href="/chats">← Все чаты</a>
+        <hr>
+        {history}
+        <form method="post">
+          <textarea name="message" required placeholder="Напиши клиенту..."></textarea>
+          <button>Отправить сообщение</button>
+        </form>
+      </div>
+    """)
+
+
+@app.route("/receipt/<int:order_id>")
 @login_required
 def receipt(order_id):
-    conn = db(); row = conn.execute('SELECT receipt_file_id FROM orders WHERE id=?',(order_id,)).fetchone(); conn.close()
-    if not row or not row['receipt_file_id']:
-        abort(404)
-    try:
-        file_info = telegram_api('getFile', {'file_id':row['receipt_file_id']})
-        file_path = file_info.get('file_path')
-        if not file_path: abort(404)
-        url = f'https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}'
-        req = urllib.request.Request(url)
-        with urllib.request.urlopen(req, timeout=25) as resp:
-            data = resp.read()
-            content_type = resp.headers.get('Content-Type','image/jpeg')
-        return send_file(BytesIO(data), mimetype=content_type, download_name=f'order-{order_id}-receipt')
-    except Exception as e:
-        return f'Не удалось загрузить квитанцию: {html_escape(e)}', 502
+    conn = db()
+    order = conn.execute(
+        "SELECT * FROM orders WHERE id = ?", (order_id,)
+    ).fetchone()
+    conn.close()
 
-if __name__ == '__main__':
-    if not ADMIN_PASSWORD:
-        raise SystemExit('Задайте ADMIN_PASSWORD в переменных окружения')
-    port = int(os.getenv('PORT','10000'))
-    app.run(host='0.0.0.0', port=port, threaded=True, use_reloader=False)
+    if not order:
+        abort(404)
+
+    if not order["receipt_file_id"]:
+        return "Чек не прикреплён", 404
+
+    try:
+        file_info = telegram_api("getFile", {"file_id": order["receipt_file_id"]})
+        file_path = file_info["file_path"]
+        url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+
+        with urllib.request.urlopen(url, timeout=20) as response:
+            file_data = response.read()
+
+        return send_file(
+            BytesIO(file_data),
+            mimetype="application/octet-stream",
+            as_attachment=False,
+            download_name=f"receipt_{order_id}"
+        )
+    except Exception as exc:
+        return f"Не удалось получить чек: {e(exc)}", 500
 
 
 def run_admin_web():
-    port = int(os.getenv('PORT', '10000'))
-    print(f'🌐 Lunevia Admin запущена на порту {port}')
-    app.run(host='0.0.0.0', port=port, threaded=True, use_reloader=False)
+    init_chat_db()
+
+    if not ADMIN_PASSWORD:
+        print("WARNING: ADMIN_PASSWORD не задан в Render Environment")
+
+    port = int(os.getenv("PORT", "10000"))
+    print(f"Lunevia admin web starts on port {port}")
+    app.run(host="0.0.0.0", port=port, threaded=True, use_reloader=False)
+
+
+if __name__ == "__main__":
+    run_admin_web()
