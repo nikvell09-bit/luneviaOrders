@@ -1448,6 +1448,32 @@ async def admin_payment_action(update: Update, context: ContextTypes.DEFAULT_TYP
 # ПОДДЕРЖКА И АДМИН-ПАНЕЛЬ
 # =========================================================
 
+
+def save_chat_message(telegram_id, direction, message_text, username=None):
+    conn = db_connect()
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS chat_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id INTEGER NOT NULL,
+            direction TEXT NOT NULL,
+            message_text TEXT NOT NULL,
+            username TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    cur.execute("""
+        INSERT INTO chat_messages
+        (telegram_id, direction, message_text, username)
+        VALUES (?, ?, ?, ?)
+    """, (telegram_id, direction, message_text, username))
+
+    conn.commit()
+    conn.close()
+
+
 async def support_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -1469,41 +1495,51 @@ async def support_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+
 async def send_support_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     question = update.message.text.strip()
     if not question:
         return
 
     user = update.effective_user
-    username = f"@{user.username}" if user.username else "без username"
+    username = user.username or ""
+
+    save_chat_message(user.id, "incoming", question, username)
 
     if ADMIN_ID:
         admin_text = (
-            "🆘 <b>НОВЫЙ ВОПРОС В ПОДДЕРЖКУ</b>\n\n"
-            f"👤 Клиент: {username}\n"
+            "💬 <b>НОВОЕ СООБЩЕНИЕ LUNEVIA</b>\n\n"
+            f"👤 Клиент: @{username or 'без username'}\n"
             f"🆔 Telegram ID: <code>{user.id}</code>\n\n"
-            f"💬 <b>Вопрос:</b>\n{question}"
+            f"💬 {html_escape(question) if 'html_escape' in globals() else question}"
         )
+
         await context.bot.send_message(
             chat_id=ADMIN_ID,
             text=admin_text,
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("💬 Ответить", callback_data=f"support_reply_{user.id}")],
-                [InlineKeyboardButton("❌ Закрыть", callback_data=f"support_close_{user.id}")],
+                [InlineKeyboardButton(
+                    "💬 Ответить",
+                    callback_data=f"support_reply_{user.id}"
+                )],
+                [InlineKeyboardButton(
+                    "❌ Закрыть",
+                    callback_data=f"support_close_{user.id}"
+                )],
             ]),
         )
 
-    context.user_data["step"] = None
+    context.user_data["step"] = "support"
+
     await update.message.reply_text(
         tr(
             context,
-            "✅ Вопрос отправлен в поддержку!\n\nМы ответим тебе здесь. 💙",
-            "✅ Питання надіслано в підтримку!\n\nМи відповімо тобі тут. 💙",
+            "✅ Сообщение получено! Поддержка ответит тебе здесь. 💙",
+            "✅ Повідомлення отримано! Підтримка відповість тобі тут. 💙",
         ),
         reply_markup=main_menu(context),
     )
-
 
 def admin_only(user_id):
     return user_id == ADMIN_ID and ADMIN_ID != 0
